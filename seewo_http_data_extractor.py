@@ -11,23 +11,36 @@ seewo_http_data_extractor.py - 使用HTTP请求+Token获取希沃课堂观察数
 
 import requests
 import json
+import re
+import os
 from typing import Dict, List, Optional, Any
 from datetime import datetime
+from pathlib import Path
 
 
 class SeewoHttpDataExtractor:
     """希沃课堂观察数据提取器（HTTP版本）"""
 
-    def __init__(self, report_id: str, token: str, username: str):
+    def __init__(self, report_id: str, token: str = None, username: str = None):
         """
         初始化提取器
 
         Args:
             report_id: 报告ID
-            token: x-token值（从浏览器Cookie中获取）
-            username: x-username值（从浏览器Cookie中获取）
+            token: x-token值（可选，如果不提供则从配置文件读取）
+            username: x-username值（可选，如果不提供则从配置文件读取）
         """
         self.report_id = report_id
+
+        # 如果未提供token，尝试从配置文件读取
+        if token is None or username is None:
+            config = self._load_config_from_md()
+            token = token or config.get('token')
+            username = username or config.get('username')
+
+            if not token or not username:
+                raise ValueError("未提供token和username，且配置文件中也未找到")
+
         self.token = token
         self.username = username
         self.api_host = "https://edulyse.seewo.com"
@@ -43,6 +56,70 @@ class SeewoHttpDataExtractor:
         }
 
         self._course_info_cache = None
+
+    @staticmethod
+    def _load_config_from_md(config_path: str = None) -> Dict[str, str]:
+        """
+        从MD文件中读取配置信息
+
+        Args:
+            config_path: 配置文件路径，默认为 SEEWO_CONFIG.md
+
+        Returns:
+            包含 token 和 username 的字典
+        """
+        if config_path is None:
+            # 默认在当前文件同目录下查找
+            current_dir = Path(__file__).parent
+            config_path = current_dir / "SEEWO_CONFIG.md"
+
+        if not os.path.exists(config_path):
+            return {}
+
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            # 匹配格式: cookie: x-token=xxx; x-username=yyy
+            cookie_match = re.search(r'^cookie:\s*(.+)$', content, re.MULTILINE)
+
+            config = {}
+            if cookie_match:
+                cookie_str = cookie_match.group(1).strip()
+
+                # 从cookie中提取token和username
+                token_match = re.search(r'x-token=([^;]+)', cookie_str)
+                username_match = re.search(r'x-username=([^;]+)', cookie_str)
+
+                if token_match:
+                    config['token'] = token_match.group(1).strip()
+                if username_match:
+                    config['username'] = username_match.group(1).strip()
+
+            return config
+
+        except Exception as e:
+            print(f"读取配置文件失败: {e}")
+            return {}
+
+    @classmethod
+    def from_config(cls, report_id: str, config_path: str = None):
+        """
+        从配置文件创建提取器
+
+        Args:
+            report_id: 报告ID
+            config_path: 配置文件路径，默认为 SEEWO_CONFIG.md
+
+        Returns:
+            SeewoHttpDataExtractor 实例
+        """
+        config = cls._load_config_from_md(config_path)
+
+        if not config.get('token') or not config.get('username'):
+            raise ValueError("配置文件中未找到有效的 token 和 username")
+
+        return cls(report_id, config['token'], config['username'])
 
     def fetch_api(self, analysis_type: str, silent: bool = False) -> Optional[Dict]:
         """
