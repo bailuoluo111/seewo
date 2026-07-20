@@ -115,36 +115,35 @@ def extract_student_behavior(detail: list) -> dict:
     if not detail or not isinstance(detail, list):
         return {}
 
-    # 行为类型时长统计
-    behavior_durations = {}
+    # behaviorType 映射（根据实际数据，3可能代表某种行为类型）
+    # 需要根据实际业务确定映射关系
+    # 暂时统计时长即可
+    total_duration = 0
+    behavior_types = {}
+
     for item in detail:
-        behavior_type = item.get("behaviorType")
         start = item.get("startTime")
         end = item.get("endTime")
-        if behavior_type and start and end:
+        behavior_type = item.get("behaviorType")
+
+        if start and end:
             duration = (end - start) / 1000  # 转换为秒
-            behavior_durations[behavior_type] = behavior_durations.get(behavior_type, 0) + duration
+            total_duration += duration
 
-    total_duration = sum(behavior_durations.values())
-
-    # 计算主动/被动学习比例
-    active_duration = behavior_durations.get("主动学习", 0)
-    passive_duration = behavior_durations.get("被动学习", 0)
+            if behavior_type is not None:
+                behavior_types[behavior_type] = behavior_types.get(behavior_type, 0) + duration
 
     result = {
-        "主动学习时长(秒)": round(active_duration, 1),
-        "被动学习时长(秒)": round(passive_duration, 1),
         "总时长(秒)": round(total_duration, 1),
+        "各行为类型时长(秒)": {str(k): round(v, 1) for k, v in behavior_types.items()},
     }
 
+    # 计算占比
     if total_duration > 0:
-        result["主动学习占比(%)"] = round(active_duration / total_duration * 100, 1)
-        result["被动学习占比(%)"] = round(passive_duration / total_duration * 100, 1)
-
-    # 知识留存率计算（简化版，需要根据实际业务逻辑调整）
-    # 这里使用主动学习占比作为知识留存率的估算
-    if total_duration > 0:
-        result["知识留存率(%)"] = round(active_duration / total_duration * 100, 1)
+        occupancy = {}
+        for behavior_type, duration in behavior_types.items():
+            occupancy[str(behavior_type)] = round(duration / total_duration * 100, 1)
+        result["各行为类型占比(%)"] = occupancy
 
     return result
 
@@ -154,17 +153,23 @@ def extract_solo_classification(detail: list) -> dict:
     if not detail or not isinstance(detail, list):
         return {}
 
+    # SOLO类型映射
+    SOLO_TYPE_MAP = {
+        "FRONT_STRUCTURE": "前结构",
+        "SINGLE_STRUCTURE": "单点结构",
+        "MULTI_STRUCTURE": "多点结构",
+        "ASSOCIATION_STRUCTURE": "关联结构",
+        "ABSTRACT_EXTENDED_STRUCTURE": "抽象拓展",
+    }
+
     solo_stats = {}
-    total_count = 0
+    total_count = len(detail)
 
     for item in detail:
-        level = item.get("soloLevel")
-        level_name = item.get("soloLevelName")
-        count = item.get("count", 0)
-
-        if level_name:
-            solo_stats[level_name] = count
-            total_count += count
+        solo_type = item.get("soloAnswerType")
+        if solo_type:
+            level_name = SOLO_TYPE_MAP.get(solo_type, solo_type)
+            solo_stats[level_name] = solo_stats.get(level_name, 0) + 1
 
     result = {
         "总回答数": total_count,
@@ -267,39 +272,76 @@ def extract_course_reengineering(detail: dict) -> dict:
     }
 
 
-def extract_question_record(detail: dict) -> dict:
+def extract_question_record(detail) -> dict:
     """提取提问记录"""
     if not detail:
         return {}
 
-    question_list = detail.get("questionList", [])
+    # 如果是列表，直接使用
+    if isinstance(detail, list):
+        return {
+            "提问总数": len(detail),
+            "问题列表": [
+                {
+                    "问题ID": q.get("questionId"),
+                    "问题文本": q.get("questionText") if isinstance(q, dict) else str(q),
+                    "提问时间": q.get("questionTime") if isinstance(q, dict) else None,
+                }
+                for q in detail
+            ]
+        }
 
-    return {
-        "提问总数": detail.get("questionCount", len(question_list)),
-        "问题列表": [
-            {
-                "问题ID": q.get("questionId"),
-                "问题文本": q.get("questionText"),
-                "提问时间": q.get("questionTime"),
-            }
-            for q in question_list
-        ] if question_list else []
-    }
+    # 如果是字典，从中提取 questionList
+    if isinstance(detail, dict):
+        question_list = detail.get("questionList", [])
+        return {
+            "提问总数": detail.get("questionCount", len(question_list)),
+            "问题列表": [
+                {
+                    "问题ID": q.get("questionId"),
+                    "问题文本": q.get("questionText"),
+                    "提问时间": q.get("questionTime"),
+                }
+                for q in question_list
+            ] if question_list else []
+        }
+
+    return {}
 
 
-def extract_bloom_classification(detail: list) -> dict:
+def extract_bloom_classification(detail) -> dict:
     """提取布鲁姆分类并计算占比"""
-    if not detail or not isinstance(detail, list):
+    if not detail:
         return {}
+
+    # 处理两种可能的结构
+    if isinstance(detail, dict):
+        # 结构: {statistics: [...], problems: [...]}
+        statistics = detail.get("statistics", [])
+    elif isinstance(detail, list):
+        statistics = detail
+    else:
+        return {}
+
+    # 布鲁姆类型映射
+    BLOOM_TYPE_MAP = {
+        "REMEMBERING": "记忆",
+        "UNDERSTANDING": "理解",
+        "APPLYING": "应用",
+        "ANALYZING": "分析",
+        "EVALUATING": "评价",
+        "CREATING": "创造",
+    }
 
     bloom_stats = {}
     total_count = 0
 
-    for item in detail:
-        level_name = item.get("bloomLevelName")
-        count = item.get("count", 0)
+    for item in statistics:
+        problem_type = item.get("problemType")
+        count = item.get("value", 0)
 
-        if level_name:
+        if problem_type:
+            level_name = BLOOM_TYPE_MAP.get(problem_type, problem_type)
             bloom_stats[level_name] = count
             total_count += count
 
@@ -331,15 +373,24 @@ def extract_teacher_appraisal(detail: list) -> dict:
         return {}
 
     appraisal_stats = {}
-    total_count = 0
+    total_count = len(detail)
+
+    # 教师理答类型映射
+    APPRAISAL_TYPE_MAP = {
+        "SIMPLE_POSITIVE": "简单肯定",
+        "TARGETED_POSITIVE": "针对性肯定",
+        "INSPIRE_ENCOURAGE": "启发鼓励",
+        "SIMPLE_REPEAT": "简单重复",
+        "FOLLOW_UP": "追问",
+        "EVALUATION": "评价",
+        "GUIDANCE": "引导",
+    }
 
     for item in detail:
-        appraisal_type = item.get("appraisalType")
-        count = item.get("count", 0)
-
+        appraisal_type = item.get("teacherAppraisalType")
         if appraisal_type:
-            appraisal_stats[appraisal_type] = count
-            total_count += count
+            type_name = APPRAISAL_TYPE_MAP.get(appraisal_type, appraisal_type)
+            appraisal_stats[type_name] = appraisal_stats.get(type_name, 0) + 1
 
     result = {
         "总理答次数": total_count,
@@ -353,33 +404,45 @@ def extract_teacher_appraisal(detail: list) -> dict:
             occupancy[appraisal_type] = round(count / total_count * 100, 1)
         result["各类型占比(%)"] = occupancy
 
-        # 计算高质量理答占比（追问、引导）
+        # 计算高质量理答占比（追问、引导、启发鼓励）
         high_quality = sum(
             count for type_name, count in appraisal_stats.items()
-            if type_name in ["追问", "引导"]
+            if type_name in ["追问", "引导", "启发鼓励"]
         )
         result["高质量理答占比(%)"] = round(high_quality / total_count * 100, 1)
 
     return result
 
 
-def extract_question_answer_extra(detail: dict) -> dict:
+def extract_question_answer_extra(detail) -> dict:
     """提取问答额外结果"""
     if not detail:
         return {}
 
-    total = detail.get("totalAnswerCount", 0)
-    effective = detail.get("effectiveAnswerCount", 0)
+    # 如果是列表，尝试从第一个元素获取数据
+    if isinstance(detail, list):
+        if len(detail) > 0 and isinstance(detail[0], dict):
+            detail = detail[0]
+        else:
+            return {}
 
-    result = {
-        "总回答次数": total,
-        "有效回答次数": effective,
-    }
+    # 如果是字典，提取字段
+    if isinstance(detail, dict):
+        total = detail.get("totalAnswerCount", 0)
+        effective = detail.get("effectiveAnswerCount", 0)
 
-    if total > 0:
-        result["有效回答率(%)"] = round(effective / total * 100, 1)
+        result = {
+            "总回答次数": total,
+            "有效回答次数": effective,
+        }
 
-    return result
+        if total > 0:
+            result["有效回答率(%)"] = round(effective / total * 100, 1)
+
+        return result
+
+    return {}
+
 
 
 def extract_question_score(detail: dict) -> dict:
@@ -478,8 +541,16 @@ def main():
         context.storage_state(path=STATE_FILE)
         browser.close()
 
+    # 保存原始数据用于调试
+    with open("seewo_raw_data.json", "w", encoding="utf-8") as f:
+        json.dump({
+            "report_id": REPORT_ID,
+            "raw_results": raw_results,
+        }, f, ensure_ascii=False, indent=2)
+    print("\n→ 原始数据已保存到 seewo_raw_data.json（用于调试）")
+
     # 提取和计算关键指标
-    print("\n→ 开始提取和计算关键指标...")
+    print("→ 开始提取和计算关键指标...")
 
     extracted_data = {
         "report_id": REPORT_ID,
@@ -491,15 +562,27 @@ def main():
         if raw.get("status") == 200:
             detail = raw.get("reportDetail")
             extractor = EXTRACTORS.get(atype)
+            module_name = raw["module"]["name"]
 
-            if extractor and detail is not None:
-                try:
-                    extracted = extractor(detail)
-                    module_name = raw["module"]["name"]
-                    extracted_data["modules"][module_name] = extracted
-                    print(f"  ✓ 已提取: {module_name}")
-                except Exception as e:
-                    print(f"  ✗ 提取失败: {raw['module']['name']} - {e}")
+            if extractor:
+                if detail is None:
+                    print(f"  ⚠ {module_name}: reportDetail 为 null")
+                    extracted_data["modules"][module_name] = {}
+                elif isinstance(detail, list) and len(detail) == 0:
+                    print(f"  ⚠ {module_name}: reportDetail 为空列表")
+                    extracted_data["modules"][module_name] = {}
+                elif isinstance(detail, dict) and len(detail) == 0:
+                    print(f"  ⚠ {module_name}: reportDetail 为空字典")
+                    extracted_data["modules"][module_name] = {}
+                else:
+                    try:
+                        extracted = extractor(detail)
+                        extracted_data["modules"][module_name] = extracted
+                        print(f"  ✓ 已提取: {module_name}")
+                    except Exception as e:
+                        print(f"  ✗ 提取失败: {module_name} - {e}")
+                        import traceback
+                        traceback.print_exc()
 
     # 保存提取结果
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
