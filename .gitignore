@@ -1,3 +1,6 @@
 *.docx
 *.xlsx
 *.zip
+__pycache__
+*.jsonl
+seewo_traces.jsonl
