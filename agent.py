@@ -221,6 +221,8 @@ def _load_config() -> dict:
         ("token",    r"x-token=([^;`\s]+)"),
         ("username", r"x-username=([^;`\s]+)"),
         ("api_key",  r"api_key:\s*([^\s`]+)"),
+        ("api_base", r"api_base:\s*([^\s`]+)"),
+        ("model",    r"model:\s*([^\s`]+)"),
     ]:
         m = re.search(pattern, content)
         if m:
@@ -232,6 +234,7 @@ def _load_config() -> dict:
 class SeewoAgent:
 
     MAX_TURNS = 10  # 防止无限循环的安全上限
+    EMPTY_ANSWER_RETRY_LIMIT = 1  # 最终回答为空时，额外追问一次
 
     def __init__(self):
         cfg = _load_config()
@@ -240,8 +243,8 @@ class SeewoAgent:
         self.username = cfg.get("username")
         if not self.api_key:
             raise ValueError("未找到 api_key，请在 SEEWO_CONFIG.md 中配置")
-        self.api_base = "https://token.cvte.com/v1"
-        self.model    = "deepseek-v4-pro"
+        self.api_base = cfg.get("api_base") or "https://token.cvte.com/v1"
+        self.model    = cfg.get("model") or "deepseek-v4-pro"
 
     # ── 内部：获取 Skill 数据 ─────────────────────────────────────────
     def _get_skill_data(self, report_id: str, skill_num: int) -> dict:
@@ -325,7 +328,7 @@ class SeewoAgent:
 
     # ── 内部：单次 LLM 调用 ───────────────────────────────────────────
     def _call_llm(self, messages: list, use_tools: bool = True):
-        """调用 LLM，返回 message 对象。"""
+        """调用 LLM，返回 (message, metadata)。"""
         with tracer.start_as_current_span("seewo.llm.call") as span:
             span.set_attribute("llm.model",          self.model)
             span.set_attribute("llm.messages.count", len(messages))
@@ -337,14 +340,17 @@ class SeewoAgent:
                     model=self.model,
                     messages=messages,
                     temperature=0.7,
-                    max_tokens=512,
+                    max_tokens=768 if not use_tools else 512,
                 )
                 if use_tools:
                     kwargs["tools"]       = TOOLS
                     kwargs["tool_choice"] = "auto"
 
                 resp = client.chat.completions.create(**kwargs)
-                msg  = resp.choices[0].message
+                choice = resp.choices[0]
+                msg = choice.message
+                finish_reason = getattr(choice, "finish_reason", None) or ""
+                content = (msg.content or "").strip()
 
                 if getattr(resp, "usage", None):
                     span.set_attribute("llm.tokens.prompt",     resp.usage.prompt_tokens)
@@ -352,9 +358,16 @@ class SeewoAgent:
                     span.set_attribute("llm.tokens.total",       resp.usage.total_tokens)
 
                 tool_calls = getattr(msg, "tool_calls", None) or []
+                span.set_attribute("llm.finish_reason", finish_reason or "unknown")
+                span.set_attribute("llm.has_content", bool(content))
+                span.set_attribute("llm.content.length", len(content))
                 span.set_attribute("llm.tool_calls.count", len(tool_calls))
                 span.set_status(Status(StatusCode.OK))
-                return msg
+                return msg, {
+                    "finish_reason": finish_reason,
+                    "content": content,
+                    "tool_calls_count": len(tool_calls),
+                }
             except Exception as e:
                 span.record_exception(e)
                 span.set_status(Status(StatusCode.ERROR, str(e)))
@@ -377,21 +390,61 @@ class SeewoAgent:
             ]
             tool_calls_total = 0
             course_info      = {}
+            empty_answer_retries = 0
 
             try:
                 for turn in range(1, self.MAX_TURNS + 1):
                     with tracer.start_as_current_span("seewo.agent.loop.turn") as ts:
                         ts.set_attribute("loop.turn", turn)
 
-                        msg        = self._call_llm(messages, use_tools=True)
+                        msg, llm_meta = self._call_llm(messages, use_tools=True)
                         tool_calls = getattr(msg, "tool_calls", None) or []
                         ts.set_attribute("tool_calls.this_turn", len(tool_calls))
+                        ts.set_attribute("llm.finish_reason", llm_meta.get("finish_reason", ""))
 
                         # ── 无工具调用 → 最终回答，退出循环 ──────────────
                         if not tool_calls:
+                            answer = llm_meta.get("content", "")
+                            ts.set_attribute("answer.length", len(answer))
+
+                            if not answer and empty_answer_retries < self.EMPTY_ANSWER_RETRY_LIMIT:
+                                empty_answer_retries += 1
+                                ts.set_attribute("llm.empty_answer_retry", empty_answer_retries)
+                                retry_messages = messages + [{
+                                    "role": "user",
+                                    "content": (
+                                        "请直接基于现有上下文输出最终回答，不要调用任何工具。"
+                                        "必须返回可直接展示给用户的中文分析文本；"
+                                        "如果信息不足，请明确说明原因。"
+                                    ),
+                                }]
+                                _, retry_meta = self._call_llm(retry_messages, use_tools=False)
+                                retry_answer = retry_meta.get("content", "")
+                                ts.set_attribute("retry.answer.length", len(retry_answer))
+                                ts.set_attribute("retry.finish_reason", retry_meta.get("finish_reason", ""))
+                                if retry_answer:
+                                    answer = retry_answer
+                                else:
+                                    ts.set_status(Status(StatusCode.ERROR, "LLM 返回空内容"))
+                                    root.set_attribute("loop.turns_total", turn)
+                                    root.set_attribute("tool_calls.total", tool_calls_total)
+                                    root.set_attribute("answer.length", 0)
+                                    root.set_status(Status(StatusCode.ERROR, "LLM 返回空内容"))
+                                    return {
+                                        "success": False,
+                                        "error": (
+                                            "模型本轮未返回可展示内容。"
+                                            f"finish_reason={llm_meta.get('finish_reason') or 'unknown'}，"
+                                            f"retry_finish_reason={retry_meta.get('finish_reason') or 'unknown'}。"
+                                            "请重试，或缩小分析范围后再问。"
+                                        ),
+                                        "course_info": course_info,
+                                        "turns": turn,
+                                        "tool_calls": tool_calls_total,
+                                    }
+
                             ts.set_attribute("loop.exit", True)
                             ts.set_status(Status(StatusCode.OK))
-                            answer = (msg.content or "").strip()
                             root.set_attribute("loop.turns_total",   turn)
                             root.set_attribute("tool_calls.total",   tool_calls_total)
                             root.set_attribute("answer.length",      len(answer))
@@ -509,7 +562,11 @@ def main():
                           f"学校：{info.get('学校名称', '')}")
                 print(f"（调用 {result['tool_calls']} 个工具，共 {result['turns']} 轮对话）")
                 print("─" * 80)
-                print(f"\n💬 {result['answer']}\n")
+                answer = (result.get("answer") or "").strip()
+                if answer:
+                    print(f"\n💬 {answer}\n")
+                else:
+                    print("\n⚠️ 本轮模型未返回可展示内容，请重试或缩小分析范围。\n")
             else:
                 print(f"❌ {result['error']}\n")
 
