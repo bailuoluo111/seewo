@@ -1,6 +1,7 @@
 *.docx
 *.xlsx
 *.zip
+.DS_Store
 __pycache__
 *.jsonl
 seewo_traces.jsonl
