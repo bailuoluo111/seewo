@@ -10,7 +10,7 @@ test_api.py — 调用正在运行的 Seewo Agent API，直观展示效果。
 
 运行：
     python test_api.py
-    python test_api.py --url http://localhost:8000
+    python test_api.py --url http://localhost:8008
     python test_api.py --input "分析 96f58e78b80c462cb1194fa2f6ef4e97 的提问质量"
 """
 
@@ -18,7 +18,7 @@ import sys
 import argparse
 import requests
 
-DEFAULT_URL = "http://localhost:8000"
+DEFAULT_URL = "http://localhost:8008"
 
 # 默认演示的几个场景（覆盖不同能力）
 DEMO_CASES = [
