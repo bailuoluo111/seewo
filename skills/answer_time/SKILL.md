@@ -36,17 +36,15 @@ priority: 4
 ## 代码示例
 
 ```python
-from seewo_http_data_extractor import SeewoHttpDataExtractor
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+from extract import build_input, extract
 
-extractor = SeewoHttpDataExtractor(
-    report_id="your-report-id",
-    token="your-token",
-    username="your-username"
-)
+input_text = build_input("your-report-id")
 
-data = extractor.extract_answer_time()
-
-input_text = f"总回答{data['总回答数']}次，快速回答(≤5秒){data['各时段占比(%)']['≤5秒']}%，中等思考(5-15秒){data['各时段占比(%)']['5-15秒']}%，深度思考(>15秒){data['各时段占比(%)']['>15秒']}%"
+from extract_all import extract_all
+all_data = extract_all("your-report-id")
+# all_data["answer_time"]  → 本维度（三档应答时间占比）
 ```
 
 **输入示例**: `总回答13次，快速回答(≤5秒)61.5%，中等思考(5-15秒)30.8%，深度思考(>15秒)7.7%`

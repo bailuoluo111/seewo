@@ -31,8 +31,8 @@ from typing import List, Dict, Any
 from datetime import datetime
 from pathlib import Path
 
-# 导入父目录中的底层提取器
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# 导入同目录下的底层提取器（已移入本目录）
+sys.path.insert(0, str(Path(__file__).parent))
 from seewo_http_data_extractor import SeewoHttpDataExtractor
 
 
@@ -348,7 +348,7 @@ class BatchDataExtractor:
 def main():
     import argparse
     p = argparse.ArgumentParser(description='批量提取希沃课堂数据（对齐前端字段）')
-    p.add_argument('--excel', default='../report.xlsx', help='源Excel路径')
+    p.add_argument('--excel', default='report.xlsx', help='源Excel路径')
     p.add_argument('--output', default=None, help='输出xlsx路径')
     p.add_argument('--delay', type=float, default=0.3, help='课程间隔秒数')
     args = p.parse_args()

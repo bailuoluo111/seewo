@@ -40,17 +40,15 @@ SOLO分类法包含5个层级：
 ## 代码示例
 
 ```python
-from seewo_http_data_extractor import SeewoHttpDataExtractor
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+from extract import build_input, extract
 
-extractor = SeewoHttpDataExtractor(
-    report_id="your-report-id",
-    token="your-token",
-    username="your-username"
-)
+input_text = build_input("your-report-id")
 
-data = extractor.extract_solo_classification()
-
-input_text = f"总回答{data['总回答数']}次，前结构{data['各等级占比(%)'].get('前结构', 0)}%，单点{data['各等级占比(%)'].get('单点结构', 0)}%，多点{data['各等级占比(%)'].get('多点结构', 0)}%，关联{data['各等级占比(%)'].get('关联结构', 0)}%，抽象拓展{data['各等级占比(%)'].get('抽象拓展', 0)}%"
+from extract_all import extract_all
+all_data = extract_all("your-report-id")
+# all_data["solo_classification"]  → 本维度（SOLO五级占比）
 ```
 
 **输入示例**: `总回答13次，前结构7.7%，单点61.5%，多点23.1%，关联7.7%，抽象拓展0%`

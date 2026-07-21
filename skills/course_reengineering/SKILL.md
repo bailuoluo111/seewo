@@ -39,17 +39,15 @@ priority: 6
 ## 代码示例
 
 ```python
-from seewo_http_data_extractor import SeewoHttpDataExtractor
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+from extract import build_input, extract
 
-extractor = SeewoHttpDataExtractor(
-    report_id="your-report-id",
-    token="your-token",
-    username="your-username"
-)
+input_text = build_input("your-report-id")
 
-data = extractor.extract_course_reengineering()
-
-input_text = f"课前到课中链接等级：{data['课前到课中链接']['等级']}，课中到课后链接等级：{data['课中到课后链接']['等级']}"
+from extract_all import extract_all
+all_data = extract_all("your-report-id")
+# all_data["course_reengineering"]  → 本维度（链接等级+子任务）
 ```
 
 **输入示例**: `课前到课中链接等级：高阶，课中到课后链接等级：高阶`

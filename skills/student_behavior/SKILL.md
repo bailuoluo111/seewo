@@ -40,24 +40,16 @@ priority: 2
 ## 代码示例
 
 ```python
-from seewo_http_data_extractor import SeewoHttpDataExtractor
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+from extract import build_input, extract
 
-extractor = SeewoHttpDataExtractor(
-    report_id="your-report-id",
-    token="your-token",
-    username="your-username"
-)
+input_text = build_input("your-report-id")
 
-data = extractor.extract_student_behavior()
-
-# 计算知识留存率
-behavior_map = {"0": 20, "3": 50, "4": 75}
-retention_rate = sum(
-    data['各行为类型占比(%)'].get(k, 0) * v / 100
-    for k, v in behavior_map.items()
-)
-
-input_text = f"被动学习{data['各行为类型占比(%)'].get('0', 0)}%，讨论{data['各行为类型占比(%)'].get('3', 0)}%，实践{data['各行为类型占比(%)'].get('4', 0)}%，估算知识留存率{retention_rate:.1f}%"
+# 可选：获取全部维度数据
+from extract_all import extract_all
+all_data = extract_all("your-report-id")
+# all_data["student_behavior"]  → 本维度（含7类行为占比+知识留存率）
 ```
 
 **输入示例**: `被动学习29.5%，讨论9.1%，实践61.4%，估算知识留存率52.4%`

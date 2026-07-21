@@ -54,20 +54,17 @@ priority: 7
 ## 代码示例
 
 ```python
-from seewo_http_data_extractor import SeewoHttpDataExtractor
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+from extract import build_input, extract
 
-extractor = SeewoHttpDataExtractor(
-    report_id="your-report-id",
-    token="your-token",
-    username="your-username"
-)
+input_text = build_input("your-report-id")
 
-# 获取各维度数据
-bloom = extractor.extract_bloom_classification()
-appraisal = extractor.extract_teacher_appraisal()
-score = extractor.extract_question_score()
-
-input_text = f"总问题{bloom['总问题数']}个，高阶思维占比{bloom['高阶思维占比(%)']}%，高质量理答占比{appraisal['高质量理答占比(%)']}%，提问有效性得分{score['提问有效性得分']}"
+from extract_all import extract_all
+all_data = extract_all("your-report-id")
+# all_data["question_effectiveness"]["布鲁姆"]  → 布鲁姆分类
+# all_data["question_effectiveness"]["理答"]    → 理答类型
+# all_data["question_effectiveness"]["提问有效性得分"]
 ```
 
 **输入示例**: `总问题37个，高阶思维占比32.4%，高质量理答占比20.0%，提问有效性得分71`

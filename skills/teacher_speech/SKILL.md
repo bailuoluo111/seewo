@@ -39,17 +39,15 @@ priority: 5
 ## 代码示例
 
 ```python
-from seewo_http_data_extractor import SeewoHttpDataExtractor
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+from extract import build_input, extract
 
-extractor = SeewoHttpDataExtractor(
-    report_id="your-report-id",
-    token="your-token",
-    username="your-username"
-)
+input_text = build_input("your-report-id")
 
-data = extractor.extract_speech_data()
-
-input_text = f"讲授字数{data['讲授字数']}字，讲授时长{data['讲授时长(秒)']}秒，平均语速{data['平均语速(字/秒)']}字/秒"
+from extract_all import extract_all
+all_data = extract_all("your-report-id")
+# all_data["teacher_speech"]  → 本维度（字数/时长/语速）
 ```
 
 **输入示例**: `讲授字数6724字，讲授时长1722秒，平均语速3.9字/秒`

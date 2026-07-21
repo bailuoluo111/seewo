@@ -36,24 +36,20 @@ priority: 1
 ## 代码示例
 
 ```python
-from seewo_http_data_extractor import SeewoHttpDataExtractor
+# 推荐：直接使用本 Skill 自带的提取工具
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+from extract import build_input, extract
 
-# 创建提取器
-extractor = SeewoHttpDataExtractor(
-    report_id="96f58e78b80c462cb1194fa2f6ef4e97",
-    token="your-token",
-    username="your-username"
-)
+# 仅本维度数据（喂给 LLM）
+input_text = build_input("your-report-id")
 
-# 获取数据
-course_info = extractor.get_course_info()
-data = extractor.extract_student_interaction()
-
-# 构造输入
-input_text = f"平均抬头率{data['平均抬头率']}%，平均举手率{data['平均举手率']}%，平均参与度{data['平均参与度']}%，{course_info['学段']}学段"
-
-# 调用LLM
-# result = call_llm(system_prompt, input_text)
+# 如需参考其他维度数据
+from extract_all import extract_all
+all_data = extract_all("your-report-id")
+# all_data["student_interaction"]  → 本维度
+# all_data["student_behavior"]     → 学习行为（可选参考）
+# ...其他维度同理
 ```
 
 **输入示例**: `平均抬头率72.6%，平均举手率35.8%，平均参与度16.8%，小学学段`
