@@ -11,11 +11,13 @@ Agent已成功接入CCH的DeepSeek v4模型！
 使用DeepSeek v4分析课堂数据，包含3个测试用例。
 
 **运行：**
+
 ```bash
 python agent_with_llm.py
 ```
 
 **特点：**
+
 - ✅ 真实LLM调用（DeepSeek v4）
 - ✅ 自动运行3个测试用例
 - ✅ 展示完整的5步执行流程
@@ -28,11 +30,13 @@ python agent_with_llm.py
 可以输入自然语言，实时获取AI分析。
 
 **运行：**
+
 ```bash
 python interactive_agent_llm.py
 ```
 
 **使用：**
+
 ```
 📝 请输入: 帮我分析报告 96f58e78b80c462cb1194fa2f6ef4e97 的学生互动
 
@@ -58,6 +62,7 @@ python interactive_agent_llm.py
 cookie: x-token=xxx; x-username=yyy
 api_key: sk-02be8377ffe2b265e752c7532cc8366e
 ```
+
 ```
 
 需要配置：
@@ -85,16 +90,19 @@ pip install openai
 ### 测试用例1: 学生互动分析
 
 **输入：**
+
 ```
 帮我分析报告 96f58e78b80c462cb1194fa2f6ef4e97 的学生互动情况
 ```
 
 **数据：**
+
 ```
 平均抬头率72.6%，平均举手率35.8%，平均参与度16.8%，小学学段
 ```
 
 **DeepSeek v4分析：**
+
 ```
 在课堂中，学生的平均抬头率达到72.6%，说明您营造了较好的听讲氛围，值得肯定。
 在小学阶段，学生的表达欲通常较强，目前举手率与参与度有提升空间。建议可尝试
@@ -134,6 +142,7 @@ Step 5: 调用DeepSeek v4（真实LLM）
 ## 💡 核心代码
 
 ### 初始化Agent
+
 ```python
 from agent_with_llm import SeewoAgentWithLLM
 
@@ -145,6 +154,7 @@ agent = SeewoAgentWithLLM(api_key="sk-xxx")
 ```
 
 ### 分析报告
+
 ```python
 result = agent.analyze("帮我分析报告 96f58e78... 的学生互动")
 
@@ -153,15 +163,16 @@ if result['success']:
 ```
 
 ### LLM调用
+
 ```python
 def call_llm(self, system_prompt: str, user_input: str) -> str:
     from openai import OpenAI
-    
+  
     client = OpenAI(
         api_key=self.api_key,
         base_url="https://token.cvte.com/v1"
     )
-    
+  
     response = client.chat.completions.create(
         model="deepseek-v4-pro",
         messages=[
@@ -171,7 +182,7 @@ def call_llm(self, system_prompt: str, user_input: str) -> str:
         temperature=0.7,
         max_tokens=300
     )
-    
+  
     return response.choices[0].message.content
 ```
 
@@ -182,6 +193,7 @@ def call_llm(self, system_prompt: str, user_input: str) -> str:
 Agent会自动从 `skills/*/SKILL.md` 加载对应的System Prompt：
 
 **Skill 1 - 学生互动分析：**
+
 ```
 你是一名教研员，拥有丰富的评课经验，且你已经具备一切评课需要的知识，
 我将给你一些关于学生维度的评课数据信息，请你依据这些信息，生成对老师
@@ -207,14 +219,15 @@ Agent会自动从 `skills/*/SKILL.md` 加载对应的System Prompt：
 
 ## 📚 文件对比
 
-| 文件 | LLM | 用途 |
-|------|-----|------|
-| `simple_agent.py` | ❌ 模拟 | 演示流程 |
-| `agent_with_llm.py` | ✅ DeepSeek v4 | 真实分析（测试） |
-| `interactive_agent.py` | ❌ 模拟 | 交互演示 |
-| `interactive_agent_llm.py` | ✅ DeepSeek v4 | 真实交互 |
+| 文件                         | LLM            | 用途             |
+| ---------------------------- | -------------- | ---------------- |
+| `simple_agent.py`          | ❌ 模拟        | 演示流程         |
+| `agent_with_llm.py`        | ✅ DeepSeek v4 | 真实分析（测试） |
+| `interactive_agent.py`     | ❌ 模拟        | 交互演示         |
+| `interactive_agent_llm.py` | ✅ DeepSeek v4 | 真实交互         |
 
 **推荐使用：**
+
 - 开发调试：`simple_agent.py`
 - 真实分析：`agent_with_llm.py`
 - 生产环境：`interactive_agent_llm.py`
