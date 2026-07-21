@@ -4,3 +4,4 @@
 __pycache__
 *.jsonl
 seewo_traces.jsonl
+seewo.md

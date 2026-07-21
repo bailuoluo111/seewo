@@ -23,37 +23,16 @@ import sys
 import json
 import importlib.util
 from pathlib import Path
-from contextlib import contextmanager
 
-# ── OpenTelemetry（未安装时自动降级为 no-op）─────────────────────────────
-try:
-    from opentelemetry import trace as _otel_trace
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.trace.status import Status, StatusCode
-    _OTEL_AVAILABLE = True
-except ImportError:
-    _OTEL_AVAILABLE = False
+# 动态加载 skill 脚本时不生成 __pycache__（避免污染 skills 目录）
+sys.dont_write_bytecode = True
 
-    class _NoOpSpan:
-        def set_attribute(self, *a, **kw): pass
-        def record_exception(self, *a, **kw): pass
-        def set_status(self, *a, **kw): pass
-
-    @contextmanager
-    def _noop_ctx(*a, **kw):
-        yield _NoOpSpan()
-
-    class _NoOpTracer:
-        def start_as_current_span(self, *a, **kw):
-            return _noop_ctx()
-
-    class StatusCode:
-        OK = "OK"; ERROR = "ERROR"
-
-    class Status:
-        def __init__(self, code, desc=""): pass
+# ── OpenTelemetry（必需依赖）─────────────────────────────────────────────
+from opentelemetry import trace as _otel_trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.trace.status import Status, StatusCode
 
 
 # ── Skill 目录映射 ────────────────────────────────────────────────────────
@@ -161,10 +140,43 @@ AGENT_SYSTEM_PROMPT = """\
 """
 
 
+# ── 紧凑 Trace Exporter（每个 span 一行精简 JSON）──────────────────────────
+class CompactSpanExporter:
+    """
+    只输出关键字段，一个 span 一行：
+      {"t":"12:00:01","span":"seewo.llm.call","dur_ms":3601,"status":"OK",
+       "attrs":{"llm.tokens.total":1402,...}}
+    去掉 resource / trace_state / kind / events / links 等重复噪音。
+    """
+    def __init__(self, out):
+        self._out = out
+
+    def export(self, spans):
+        import json as _json
+        from datetime import datetime as _dt
+        for s in spans:
+            attrs = dict(s.attributes or {})
+            line = {
+                "t":      _dt.fromtimestamp(s.start_time / 1e9).strftime("%H:%M:%S"),
+                "span":   s.name,
+                "dur_ms": round((s.end_time - s.start_time) / 1e6, 1),
+                "status": s.status.status_code.name if s.status else "UNSET",
+                "trace":  f"{s.context.trace_id:032x}"[:8],  # 短 trace_id，方便分组
+            }
+            if attrs:
+                line["attrs"] = attrs
+            self._out.write(_json.dumps(line, ensure_ascii=False) + "\n")
+        return None
+
+    def shutdown(self):
+        pass
+
+    def force_flush(self, timeout_millis: int = 30000):
+        return True
+
+
 # ── Tracer 初始化 ─────────────────────────────────────────────────────────
 def _setup_tracing():
-    if not _OTEL_AVAILABLE:
-        return _NoOpTracer()
     import sys as _sys
     resource = Resource.create({"service.name": "seewo-agent", "service.version": "2.0"})
     provider = TracerProvider(resource=resource)
@@ -173,14 +185,14 @@ def _setup_tracing():
     #   SEEWO_TRACE_FILE=<path>  自定义文件路径
     #   SEEWO_TRACE_CONSOLE=1    改为打印到 stderr（调试用）
     #   OTEL_EXPORTER_OTLP_ENDPOINT=<url>  发送到 OTLP 后端（Jaeger/Tempo 等）
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     if os.environ.get("SEEWO_TRACE_CONSOLE") == "1":
-        provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter(out=_sys.stderr)))
+        provider.add_span_processor(SimpleSpanProcessor(CompactSpanExporter(out=_sys.stderr)))
     else:
         trace_file = os.environ.get("SEEWO_TRACE_FILE", str(Path(__file__).parent / "seewo_traces.jsonl"))
         f = open(trace_file, "a", encoding="utf-8", buffering=1)
         # SimpleSpanProcessor：span 结束即同步写入，避免异步 flush 时机问题
-        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-        provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter(out=f)))
+        provider.add_span_processor(SimpleSpanProcessor(CompactSpanExporter(out=f)))
         _setup_tracing.trace_file = trace_file  # 供 CLI 启动时提示
 
     otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
