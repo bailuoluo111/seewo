@@ -1,34 +1,99 @@
 #!/usr/bin/env python3
 """
-批量提取希沃课堂数据脚本
+批量提取希沃课堂数据脚本（严格对齐前端展示字段）
 
-从Excel文件中读取课程链接，提取course_id，批量调用API获取所有技能数据，
-汇总成一个Excel文件，每行一个课程。
+从Excel读取课程链接 → 提取course_id → 调用API → 汇总成一个Excel，
+每行一个课程。所有字段名和取值口径与前端报告页面保持一致。
+
+字段来源（已用前端截图逐项校验）：
+  学生互动数据   → studentStudyStatistic
+  学习行为分布   → studentStudyBehavior（按时长占比，7类学习金字塔）
+  回答建构分类   → solo（SOLO五级，占比排除无回答）
+  应答时间       → studentAnswerClassification（回答时长分档）
+  讲授分析       → speechData
+  课堂流程重构   → courseProcessReengineering
+  提问有效性     → bloom(提问总数) + teacherAppraisalClassification(评价次数) + questionScoreExplain(平均有效性)
+  提问类型       → bloom（布鲁姆六级）
+  候答时间       → questionAnswerExtraResult（近似：首个回答起始 - 提问结束）
+  评价类型       → teacherAppraisalClassification
 
 使用方法:
     cd /Users/zwj/Projects/seewo/batch_analysis
     python batch_extract.py
-    python batch_extract.py --output my_result.xlsx
+    python batch_extract.py --excel ../report.xlsx --output 结果.xlsx
 """
 
 import sys
 import re
 import time
 import pandas as pd
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from datetime import datetime
 from pathlib import Path
 
-# 添加父目录到路径以便导入父目录中的模块
+# 导入父目录中的底层提取器
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from skill_helpers import get_all_skills_input
 from seewo_http_data_extractor import SeewoHttpDataExtractor
 
 
 # ============================================================================
-# 主提取器类
+# 枚举映射（均已用真实数据校验）
 # ============================================================================
+
+# 学习行为分布：behaviorType 为学习金字塔层级顺序
+BEHAVIOR_MAP = {
+    '0': '听讲', '1': '阅读', '2': '视听', '3': '演示',
+    '4': '讨论', '5': '实践', '6': '教给他人',
+}
+PASSIVE_TYPES = {'0', '1', '2', '3'}   # 被动学习
+ACTIVE_TYPES = {'4', '5', '6'}         # 主动学习
+
+# 回答建构分类（SOLO）
+SOLO_MAP = {
+    'FRONT_STRUCTURE': '前结构',
+    'SINGLE_STRUCTURE': '单点结构',
+    'MULTI_STRUCTURE': '多点结构',
+    'ASSOCIATION_STRUCTURE': '关联结构',
+    'ABSTRACT_EXTENDED_STRUCTURE': '抽象拓展结构',
+}
+SOLO_ORDER = ['前结构', '单点结构', '多点结构', '关联结构', '抽象拓展结构']
+
+# 布鲁姆分类（提问类型）
+BLOOM_MAP = {
+    'REMEMBERING': '记忆', 'UNDERSTANDING': '理解', 'APPLYING': '应用',
+    'ANALYZING': '分析', 'EVALUATING': '评价', 'CREATING': '创造',
+}
+BLOOM_ORDER = ['记忆', '理解', '应用', '分析', '评价', '创造']
+
+# 评价类型（教师理答）
+APPRAISAL_MAP = {
+    'SIMPLE_POSITIVE': '简单肯定',
+    'TARGETED_POSITIVE': '针对肯定',
+    'INSPIRE_ENCOURAGE': '激励',
+    'DIRECT_NEGATIVE': '否定',
+    'REPEAT_QUESTION_OR_STUDENT_ANSWER': '重复',
+}
+APPRAISAL_ORDER = ['简单肯定', '针对肯定', '激励', '否定', '重复']
+
+# 课堂流程重构等级
+LEVEL_MAP = {
+    'BEGINNER_LEVEL': '初阶',
+    'PROGRESSIVE_LEVEL': '进阶',
+    'INTERMEDIATE_LEVEL': '中阶',
+    'ADVANCED_LEVEL': '高阶',
+}
+
+# 应答时间分档（秒）
+ANSWER_TIME_ORDER = ['应答5秒以内', '应答5~15秒', '应答15秒以上']
+# 候答时间分档（秒，近似）
+WAIT_TIME_ORDER = ['等候3秒以内', '等候3~5秒', '等候5秒以上']
+
+def _pct(counter: Dict[str, float], total: float) -> Dict[str, float]:
+    """把计数字典转成占比(%)字典，保留1位小数。"""
+    if not total:
+        return {}
+    return {k: round(v / total * 100, 1) for k, v in counter.items()}
+
 
 class BatchDataExtractor:
     """批量课堂数据提取器：读取Excel → 提取course_id → 调用API → 汇总输出"""
@@ -39,248 +104,241 @@ class BatchDataExtractor:
         self.results: List[Dict[str, Any]] = []
         self.errors: List[Dict[str, str]] = []
 
-    # -------------------------------------------------------------------------
-    # Step 1: 从Excel提取课程ID
-    # -------------------------------------------------------------------------
-
+    # ------------------------------------------------------------------
+    # Step 1: 从Excel提取course_id
+    # ------------------------------------------------------------------
     def extract_course_ids(self) -> List[str]:
-        """
-        解析Excel，提取所有网页端链接中的course_id。
-
-        URL格式：
-          https://easiinsight.seewo.com/report/detail/<id>/home
-          https://easiinsight.seewo.com/report/detail/js2/<id>/home
-          https://easiinsight.seewo.com/analysis/report/detail/<id>/home
-        """
+        """解析Excel网页端链接列，提取detail后的32位course_id。"""
         print(f"→ 读取Excel: {self.excel_path}")
         df = pd.read_excel(self.excel_path, header=None)
-
-        url_pattern = re.compile(r'detail/(?:[^/]+/)?([0-9a-f]{32})', re.IGNORECASE)
-        seen = set()
-        course_ids = []
-
+        pat = re.compile(r'detail/(?:[^/]+/)?([0-9a-f]{32})', re.IGNORECASE)
+        seen, ids = set(), []
         for _, row in df.iterrows():
             for cell in row:
-                if not isinstance(cell, str):
-                    continue
-                if 'easiinsight.seewo.com' not in cell:
-                    continue
-                m = url_pattern.search(cell)
-                if m:
-                    cid = m.group(1).lower()
-                    if cid not in seen:
-                        seen.add(cid)
-                        course_ids.append(cid)
-                    break  # 每行最多取一个ID
+                if isinstance(cell, str) and 'easiinsight.seewo.com' in cell:
+                    m = pat.search(cell)
+                    if m and m.group(1).lower() not in seen:
+                        seen.add(m.group(1).lower())
+                        ids.append(m.group(1).lower())
+                    break
+        self.course_ids = ids
+        print(f"✓ 找到 {len(ids)} 个唯一课程ID")
+        return ids
 
-        self.course_ids = course_ids
-        print(f"✓ 找到 {len(course_ids)} 个唯一课程ID")
-        return course_ids
-
-    # -------------------------------------------------------------------------
-    # Step 2: 提取单个课程的全部数据
-    # -------------------------------------------------------------------------
-
+    # ------------------------------------------------------------------
+    # Step 2: 提取单个课程 → 一行数据（字段名对齐前端）
+    # ------------------------------------------------------------------
     def _extract_single_course(self, course_id: str) -> Dict[str, Any]:
-        """
-        对一个course_id调用所有Skill并整理成一行数据。
+        ext = SeewoHttpDataExtractor(course_id)
+        info = ext.get_course_info()
 
-        数据来源映射（字段名来自实际API响应，通过seewo_http_data_extractor提取）：
-          Skill 1 → 学生互动: 平均抬头率 / 平均举手率 / 平均参与度
-          Skill 2 → 学习行为: 各行为类型占比, 知识留存率（加权估算）
-          Skill 3 → SOLO分类: 各等级回答数及占比
-          Skill 4 → 应答时间: 各时段回答数及占比
-          Skill 5 → 讲授分析: 讲授字数 / 时长 / 语速
-          Skill 6 → 课堂流程重构: 课前↔课中 / 课中↔课后 等级
-          Skill 7 → 提问有效性: 布鲁姆分类 / 理答类型 / 提问有效性得分
-        """
-        # 一次性获取全部7个Skill的数据（每个Skill内部会复用同一个extractor实例的缓存）
-        all_skills = get_all_skills_input(course_id)
-
-        # ── 课程基本信息 ──────────────────────────────────────────────────────
-        course_info = all_skills[1]['course_info']
         row: Dict[str, Any] = {
-            'course_id':    course_id,
-            'course_name':  course_info.get('课程名称', ''),
-            'teacher_name': course_info.get('教师姓名', ''),
-            'school':       course_info.get('学校名称', ''),
-            'stage':        course_info.get('学段', ''),
-            'subject':      course_info.get('学科', ''),
-            'classroom':    course_info.get('教室', ''),
-            'class_start':  course_info.get('上课时间', ''),
-            'class_end':    course_info.get('下课时间', ''),
+            'course_id':   course_id,
+            '课程名称':     info.get('课程名称', ''),
+            '教师姓名':     info.get('教师姓名', ''),
+            '学校':        info.get('学校名称', ''),
+            '学段':        info.get('学段', ''),
+            '学科':        info.get('学科', ''),
         }
 
-        # ── Skill 1: 学生互动 ─────────────────────────────────────────────────
-        s1 = all_skills[1]['raw_data']
-        row['平均抬头率(%)']  = s1.get('平均抬头率', 0)
-        row['平均举手率(%)']  = s1.get('平均举手率', 0)
-        row['平均参与度(%)']  = s1.get('平均参与度', 0)
-
-        # ── Skill 2: 学习行为 ─────────────────────────────────────────────────
-        s2 = all_skills[2]['raw_data']
-        pct2 = s2.get('各行为类型占比(%)', {})
-        row['学习行为_被动学习占比(%)'] = pct2.get('0', 0)
-        row['学习行为_讨论占比(%)']    = pct2.get('3', 0)
-        row['学习行为_实践占比(%)']    = pct2.get('4', 0)
-        row['学习行为_总时长(秒)']     = s2.get('总时长(秒)', 0)
-        # 知识留存率：加权估算（被动*20% + 讨论*50% + 实践*75%）
-        row['估算知识留存率(%)']       = round(all_skills[2].get('retention_rate', 0), 1)
-
-        # ── Skill 3: SOLO分类 ─────────────────────────────────────────────────
-        s3 = all_skills[3]['raw_data']
-        s3_cnt = s3.get('各等级回答数', {})
-        s3_pct = s3.get('各等级占比(%)', {})
-        row['SOLO_总回答数']        = s3.get('总回答数', 0)
-        row['SOLO_前结构_数量']     = s3_cnt.get('前结构', 0)
-        row['SOLO_单点结构_数量']   = s3_cnt.get('单点结构', 0)
-        row['SOLO_多点结构_数量']   = s3_cnt.get('多点结构', 0)
-        row['SOLO_关联结构_数量']   = s3_cnt.get('关联结构', 0)
-        row['SOLO_抽象拓展_数量']   = s3_cnt.get('抽象拓展', 0)
-        row['SOLO_前结构_占比(%)']  = s3_pct.get('前结构', 0)
-        row['SOLO_单点结构_占比(%)'] = s3_pct.get('单点结构', 0)
-        row['SOLO_多点结构_占比(%)'] = s3_pct.get('多点结构', 0)
-        row['SOLO_关联结构_占比(%)'] = s3_pct.get('关联结构', 0)
-        row['SOLO_抽象拓展_占比(%)'] = s3_pct.get('抽象拓展', 0)
-
-        # ── Skill 4: 应答时间 ─────────────────────────────────────────────────
-        s4 = all_skills[4]['raw_data']
-        s4_cnt = s4.get('各时段回答数', {})
-        s4_pct = s4.get('各时段占比(%)', {})
-        row['应答_总回答数']           = s4.get('总回答数', 0)
-        row['应答_≤5秒_数量']         = s4_cnt.get('≤5秒', 0)
-        row['应答_5-15秒_数量']       = s4_cnt.get('5-15秒', 0)
-        row['应答_>15秒_数量']        = s4_cnt.get('>15秒', 0)
-        row['应答_≤5秒_占比(%)']      = s4_pct.get('≤5秒', 0)
-        row['应答_5-15秒_占比(%)']    = s4_pct.get('5-15秒', 0)
-        row['应答_>15秒_占比(%)']     = s4_pct.get('>15秒', 0)
-
-        # ── Skill 5: 讲授分析 ─────────────────────────────────────────────────
-        s5 = all_skills[5]['raw_data']
-        row['讲授_字数']            = s5.get('讲授字数', 0)
-        row['讲授_时长(秒)']        = s5.get('讲授时长(秒)', 0)
-        row['讲授_平均语速(字/秒)'] = s5.get('平均语速(字/秒)', 0)
-
-        # ── Skill 6: 课堂流程重构 ─────────────────────────────────────────────
-        s6 = all_skills[6]['raw_data']
-        row['课前→课中_链接等级'] = s6.get('课前到课中链接', {}).get('等级', '')
-        row['课中→课后_链接等级'] = s6.get('课中到课后链接', {}).get('等级', '')
-
-        # ── Skill 7: 提问有效性 ───────────────────────────────────────────────
-        s7 = all_skills[7]['raw_data']
-        bloom    = s7.get('bloom', {})
-        appraise = s7.get('appraisal', {})
-        score    = s7.get('score', {})
-
-        bloom_cnt = bloom.get('各等级问题数', {})
-        bloom_pct = bloom.get('各等级占比(%)', {})
-        row['布鲁姆_总问题数']      = bloom.get('总问题数', 0)
-        row['布鲁姆_记忆_数量']     = bloom_cnt.get('记忆', 0)
-        row['布鲁姆_理解_数量']     = bloom_cnt.get('理解', 0)
-        row['布鲁姆_应用_数量']     = bloom_cnt.get('应用', 0)
-        row['布鲁姆_分析_数量']     = bloom_cnt.get('分析', 0)
-        row['布鲁姆_评价_数量']     = bloom_cnt.get('评价', 0)
-        row['布鲁姆_创造_数量']     = bloom_cnt.get('创造', 0)
-        row['布鲁姆_记忆_占比(%)']  = bloom_pct.get('记忆', 0)
-        row['布鲁姆_理解_占比(%)']  = bloom_pct.get('理解', 0)
-        row['布鲁姆_应用_占比(%)']  = bloom_pct.get('应用', 0)
-        row['布鲁姆_分析_占比(%)']  = bloom_pct.get('分析', 0)
-        row['布鲁姆_评价_占比(%)']  = bloom_pct.get('评价', 0)
-        row['布鲁姆_创造_占比(%)']  = bloom_pct.get('创造', 0)
-        row['布鲁姆_高阶思维占比(%)'] = bloom.get('高阶思维占比(%)', 0)
-
-        appr_cnt = appraise.get('各类型次数', {})
-        appr_pct = appraise.get('各类型占比(%)', {})
-        row['理答_总次数']            = appraise.get('总理答次数', 0)
-        row['理答_针对性肯定_数量']   = appr_cnt.get('针对性肯定', 0)
-        row['理答_简单肯定_数量']     = appr_cnt.get('简单肯定', 0)
-        row['理答_启发鼓励_数量']     = appr_cnt.get('启发鼓励', 0)
-        row['理答_追问_数量']         = appr_cnt.get('追问', 0)
-        row['理答_引导_数量']         = appr_cnt.get('引导', 0)
-        row['理答_针对性肯定_占比(%)'] = appr_pct.get('针对性肯定', 0)
-        row['理答_简单肯定_占比(%)']   = appr_pct.get('简单肯定', 0)
-        row['理答_启发鼓励_占比(%)']   = appr_pct.get('启发鼓励', 0)
-        row['理答_追问_占比(%)']       = appr_pct.get('追问', 0)
-        row['理答_引导_占比(%)']       = appr_pct.get('引导', 0)
-        row['理答_高质量理答占比(%)']  = appraise.get('高质量理答占比(%)', 0)
-
-        row['提问有效性得分'] = score.get('提问有效性得分', 0)
-
+        row.update(self._student_interaction(ext))   # 学生互动数据
+        row.update(self._study_behavior(ext))        # 学习行为分布
+        row.update(self._solo(ext))                  # 回答建构分类
+        row.update(self._answer_time(ext))           # 应答时间
+        row.update(self._speech(ext))                # 讲授分析
+        row.update(self._reengineering(ext))         # 课堂流程重构
+        row.update(self._question_effectiveness(ext))  # 提问有效性+提问类型+评价类型
+        row.update(self._wait_time(ext))             # 候答时间（近似）
         return row
 
-    # -------------------------------------------------------------------------
+    # ── 学生互动数据 ──────────────────────────────────────────────────
+    def _student_interaction(self, ext) -> Dict[str, Any]:
+        d = ext.fetch_api('studentStudyStatistic', silent=True) or {}
+        det = d.get('reportDetail', {}) or {}
+        return {
+            '学生互动-平均抬头率(%)': round(det.get('raiseHeadRatio', 0) * 100, 1),
+            '学生互动-平均举手率(%)': round(det.get('handUpRatio', 0) * 100, 1),
+            '学生互动-平均参与度(%)': round(det.get('answerRatio', 0) * 100, 1),
+        }
+
+    # ── 学习行为分布（按时长占比，7类学习金字塔）────────────────────────
+    def _study_behavior(self, ext) -> Dict[str, Any]:
+        d = ext.fetch_api('studentStudyBehavior', silent=True) or {}
+        det = d.get('reportDetail', []) or []
+        dur: Dict[str, float] = {}
+        for it in det:
+            bt = str(it.get('behaviorType'))
+            dur[bt] = dur.get(bt, 0) + it.get('durationTimeMills', 0)
+        total = sum(dur.values())
+        out = {
+            '学习行为-被动学习(%)': round(sum(v for k, v in dur.items() if k in PASSIVE_TYPES) / total * 100, 1) if total else 0,
+            '学习行为-主动学习(%)': round(sum(v for k, v in dur.items() if k in ACTIVE_TYPES) / total * 100, 1) if total else 0,
+        }
+        for code, name in BEHAVIOR_MAP.items():
+            out[f'学习行为-{name}(%)'] = round(dur.get(code, 0) / total * 100, 1) if total else 0
+        return out
+
+    # ── 回答建构分类（SOLO五级，占比排除无回答）────────────────────────
+    def _solo(self, ext) -> Dict[str, Any]:
+        d = ext.fetch_api('solo', silent=True) or {}
+        det = d.get('reportDetail', []) or []
+        cnt: Dict[str, int] = {}
+        for it in det:
+            name = SOLO_MAP.get(it.get('soloAnswerType'))
+            if name:  # 忽略 NO_ANSWER 等非五级项
+                cnt[name] = cnt.get(name, 0) + 1
+        total = sum(cnt.values())
+        out = {'回答建构分类-总回答数': total}
+        pct = _pct(cnt, total)
+        for name in SOLO_ORDER:
+            out[f'回答建构分类-{name}(%)'] = pct.get(name, 0)
+        return out
+
+    # ── 应答时间（回答时长分档 ≤5 / 5-15 / >15 秒）─────────────────────
+    def _answer_time(self, ext) -> Dict[str, Any]:
+        d = ext.fetch_api('studentAnswerClassification', silent=True) or {}
+        det = d.get('reportDetail', []) or []
+        b = {'应答5秒以内': 0, '应答5~15秒': 0, '应答15秒以上': 0}
+        for it in det:
+            s, e = it.get('startTime'), it.get('endTime')
+            if s is None or e is None:
+                continue
+            g = (e - s) / 1000
+            if g <= 5:
+                b['应答5秒以内'] += 1
+            elif g <= 15:
+                b['应答5~15秒'] += 1
+            else:
+                b['应答15秒以上'] += 1
+        total = sum(b.values())
+        out = {'应答时间-总回答数': total}
+        pct = _pct(b, total)
+        for name in ANSWER_TIME_ORDER:
+            out[f'应答时间-{name}(%)'] = pct.get(name, 0)
+        return out
+
+    # ── 讲授分析 ──────────────────────────────────────────────────────
+    def _speech(self, ext) -> Dict[str, Any]:
+        d = ext.fetch_api('speechData', silent=True) or {}
+        det = d.get('reportDetail', {}) or {}
+        wc = det.get('speechWordCount', 0)
+        dur = det.get('speechDurationInSeconds', 0)
+        return {
+            '讲授分析-平均语速(字/秒)': round(wc / dur, 1) if dur else 0,
+            '讲授分析-讲授字数(词)': wc,
+        }
+
+    # ── 课堂流程重构 ──────────────────────────────────────────────────
+    def _reengineering(self, ext) -> Dict[str, Any]:
+        d = ext.fetch_api('courseProcessReengineering', silent=True) or {}
+        det = d.get('reportDetail', {}) or {}
+        pre = det.get('preClassToInClassLink') or {}
+        post = det.get('inClassToPostClassLink') or {}
+        return {
+            '课堂流程重构-课前与课中链接': LEVEL_MAP.get(pre.get('level'), pre.get('level', '')),
+            '课堂流程重构-课中与课后链接': LEVEL_MAP.get(post.get('level'), post.get('level', '')),
+        }
+
+    # ── 提问有效性（三卡片）+ 提问类型（布鲁姆）+ 评价类型 ──────────────
+    def _question_effectiveness(self, ext) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+
+        # 布鲁姆分类 → 提问总数 + 提问类型占比
+        bd = ext.fetch_api('bloom', silent=True) or {}
+        det = bd.get('reportDetail')
+        stats = det.get('statistics', []) if isinstance(det, dict) else (det or [])
+        bloom_cnt: Dict[str, int] = {}
+        for it in stats:
+            name = BLOOM_MAP.get(it.get('problemType'))
+            if name:
+                bloom_cnt[name] = it.get('value', 0)
+        total_q = sum(bloom_cnt.values())
+        out['提问有效性-提问总数'] = total_q
+        bpct = _pct(bloom_cnt, total_q)
+        for name in BLOOM_ORDER:
+            out[f'提问类型-{name}(%)'] = bpct.get(name, 0)
+
+        # 教师理答 → 评价次数 + 评价类型占比
+        ad = ext.fetch_api('teacherAppraisalClassification', silent=True) or {}
+        appr = ad.get('reportDetail', []) or []
+        appr_cnt: Dict[str, int] = {}
+        for it in appr:
+            name = APPRAISAL_MAP.get(it.get('teacherAppraisalType'))
+            if name:
+                appr_cnt[name] = appr_cnt.get(name, 0) + 1
+        total_a = len(appr)
+        out['提问有效性-评价次数'] = total_a
+        apct = _pct(appr_cnt, sum(appr_cnt.values()))
+        for name in APPRAISAL_ORDER:
+            out[f'评价类型-{name}(%)'] = apct.get(name, 0)
+
+        # 提问有效性得分
+        sd = ext.fetch_api('questionScoreExplain', silent=True) or {}
+        sdet = sd.get('reportDetail', {}) or {}
+        out['提问有效性-平均有效性(分)'] = sdet.get('score', 0)
+        return out
+
+    # ── 候答时间（近似：首个回答起始 - 提问结束）────────────────────────
+    def _wait_time(self, ext) -> Dict[str, Any]:
+        d = ext.fetch_api('questionAnswerExtraResult', silent=True) or {}
+        det = d.get('reportDetail', []) or []
+        b = {'等候3秒以内': 0, '等候3~5秒': 0, '等候5秒以上': 0}
+        for it in det:
+            q = it.get('question')
+            al = it.get('answerList') or []
+            if not q or not al:
+                continue
+            gap = (al[0].get('startTime', 0) - q.get('endTime', 0)) / 1000
+            if gap < 0:
+                continue
+            if gap <= 3:
+                b['等候3秒以内'] += 1
+            elif gap <= 5:
+                b['等候3~5秒'] += 1
+            else:
+                b['等候5秒以上'] += 1
+        total = sum(b.values())
+        pct = _pct(b, total)
+        # 列名加 (近似) 后缀，提示该口径为反推、非前端精确值
+        return {f'候答时间-{name}(%)(近似)': pct.get(name, 0) for name in WAIT_TIME_ORDER}
+
+    # ------------------------------------------------------------------
     # Step 3: 批量处理
-    # -------------------------------------------------------------------------
-
-    def batch_extract(self, delay_seconds: float = 0.5) -> pd.DataFrame:
-        """
-        遍历所有course_id，依次提取数据并汇总。
-
-        Args:
-            delay_seconds: 每个课程之间的等待时间（避免触发速率限制）
-        """
+    # ------------------------------------------------------------------
+    def batch_extract(self, delay: float = 0.3) -> pd.DataFrame:
         total = len(self.course_ids)
-        print(f"\n→ 开始批量提取（共 {total} 个课程，预计 {total * delay_seconds:.0f}+ 秒）")
+        print(f"\n→ 开始批量提取（共 {total} 个课程）")
         print("=" * 80)
-
-        for idx, course_id in enumerate(self.course_ids, 1):
-            print(f"\n[{idx:2d}/{total}] {course_id}", end="  ", flush=True)
-
+        for i, cid in enumerate(self.course_ids, 1):
+            print(f"[{i:2d}/{total}] {cid}", end="  ", flush=True)
             try:
-                row = self._extract_single_course(course_id)
+                row = self._extract_single_course(cid)
                 self.results.append(row)
-                print(f"✓  {row['course_name']} / {row['teacher_name']}")
+                print(f"✓  {row['课程名称']} / {row['教师姓名']}")
             except Exception as e:
-                self.errors.append({'course_id': course_id, 'error': str(e)})
+                self.errors.append({'course_id': cid, 'error': str(e)})
                 print(f"✗  {e}")
-
-            # 非最后一个课程时等待
-            if idx < total:
-                time.sleep(delay_seconds)
-
-        print("\n" + "=" * 80)
-        print(f"提取完成：✓ {len(self.results)} 成功  ✗ {len(self.errors)} 失败")
-
-        if self.errors:
-            print("\n失败列表：")
-            for err in self.errors:
-                print(f"  • {err['course_id']}: {err['error']}")
-
+            if i < total:
+                time.sleep(delay)
+        print("=" * 80)
+        print(f"完成：✓ {len(self.results)} 成功  ✗ {len(self.errors)} 失败")
+        for err in self.errors:
+            print(f"  • {err['course_id']}: {err['error']}")
         return pd.DataFrame(self.results) if self.results else pd.DataFrame()
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Step 4: 导出Excel
-    # -------------------------------------------------------------------------
-
+    # ------------------------------------------------------------------
     def export_to_excel(self, df: pd.DataFrame, output_path: str) -> None:
-        """
-        将汇总数据写入Excel，成功数据和失败记录分两个sheet。
-        """
         if df.empty:
             print("⚠️  没有数据可导出")
             return
-
         print(f"\n→ 写入Excel: {output_path}")
-
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='课程数据汇总', index=False)
             if self.errors:
                 pd.DataFrame(self.errors).to_excel(writer, sheet_name='提取失败', index=False)
-
         print(f"✓ 写入成功：{len(df)} 行 × {len(df.columns)} 列")
-
-        # 展示关键指标的均值
-        numeric_cols = [
-            '平均抬头率(%)', '平均举手率(%)', '平均参与度(%)',
-            '估算知识留存率(%)', '布鲁姆_高阶思维占比(%)',
-            '理答_高质量理答占比(%)', '提问有效性得分',
-        ]
-        print("\n📊 关键指标均值（所有成功课程）：")
-        for col in numeric_cols:
-            if col in df.columns:
-                vals = pd.to_numeric(df[col], errors='coerce').dropna()
-                if not vals.empty:
-                    print(f"   {col}: {vals.mean():.1f}")
 
 
 # ============================================================================
@@ -289,63 +347,40 @@ class BatchDataExtractor:
 
 def main():
     import argparse
-
-    parser = argparse.ArgumentParser(description='批量提取希沃课堂数据')
-    parser.add_argument(
-        '--excel',
-        default='../【企微登录使用】对外演示的课堂反馈报告.xlsx',
-        help='源Excel文件路径（默认：父目录下的演示报告）',
-    )
-    parser.add_argument(
-        '--output',
-        default=None,
-        help='输出文件路径（默认：当前目录下带时间戳的xlsx）',
-    )
-    parser.add_argument(
-        '--delay',
-        type=float,
-        default=0.5,
-        help='每个课程之间的间隔秒数（默认：0.5）',
-    )
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description='批量提取希沃课堂数据（对齐前端字段）')
+    p.add_argument('--excel', default='../report.xlsx', help='源Excel路径')
+    p.add_argument('--output', default=None, help='输出xlsx路径')
+    p.add_argument('--delay', type=float, default=0.3, help='课程间隔秒数')
+    args = p.parse_args()
 
     print("\n" + "=" * 80)
     print("🤖  希沃课堂数据批量提取工具")
     print("=" * 80)
 
-    # 解析Excel路径
-    excel_path = Path(args.excel)
-    if not excel_path.is_absolute():
-        excel_path = (Path(__file__).parent / excel_path).resolve()
-
-    if not excel_path.exists():
-        print(f"❌ 找不到Excel文件：{excel_path}")
+    excel = Path(args.excel)
+    if not excel.is_absolute():
+        excel = (Path(__file__).parent / excel).resolve()
+    if not excel.exists():
+        print(f"❌ 找不到Excel文件：{excel}")
         return
 
-    # 解析输出路径
     if args.output:
-        output_path = Path(args.output)
+        out = Path(args.output)
     else:
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_path = Path(__file__).parent / f"课程数据汇总_{ts}.xlsx"
+        out = Path(__file__).parent / f"课程数据汇总_{ts}.xlsx"
 
-    # 执行
-    extractor = BatchDataExtractor(str(excel_path))
-
-    extractor.extract_course_ids()
-    if not extractor.course_ids:
-        print("❌ 未找到任何课程ID，请检查Excel文件格式")
+    ext = BatchDataExtractor(str(excel))
+    ext.extract_course_ids()
+    if not ext.course_ids:
+        print("❌ 未找到任何课程ID")
         return
-
-    df = extractor.batch_extract(delay_seconds=args.delay)
-
+    df = ext.batch_extract(delay=args.delay)
     if df.empty:
         print("\n❌ 没有成功提取任何数据")
         return
-
-    extractor.export_to_excel(df, str(output_path))
-
-    print(f"\n✅ 完成！结果文件：{output_path}\n")
+    ext.export_to_excel(df, str(out))
+    print(f"\n✅ 完成！结果文件：{out}\n")
 
 
 if __name__ == '__main__':
