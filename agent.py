@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-agent.py — 希沃课堂分析 Agent（ReAct + MCP 工具桥接）
+agent.py — 通用 MCP ReAct Agent
 
 架构：ReAct (Reasoning + Acting)
-  - 通过本地 MCP 服务统一发现并调用课堂观察工具
-  - report_id 由 LLM 从自然语言中提取，不限制输入格式
+  - 通过本地 MCP 服务发现并调用工具
+  - Agent 不内置任何业务领域逻辑
   - Agent loop：持续调用 LLM → 执行工具 → 喂回结果，直到无工具调用退出
   - OpenTelemetry 全链路追踪
 
 使用方法:
     python agent.py
-
-自然语言输入示例:
-    帮我看看这节课的学生互动：https://easiinsight.seewo.com/report/detail/96f58e78b80c462cb1194fa2f6ef4e97/home
-    96f58e78b80c462cb1194fa2f6ef4e97 的提问质量怎么样？
-    全面分析一下这个报告 96f58e78b80c462cb1194fa2f6ef4e97
 """
 
 import re
@@ -34,27 +29,19 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.trace.status import Status, StatusCode
 
 from mcp.client import SeewoMCPClient
-from mcp.tools import TOOL_REGISTRY
 
-
-# ── Skill 根目录 ──────────────────────────────────────────────────────────
-SKILLS_DIR = Path(__file__).parent / "skills"
 
 # ── Agent 系统提示 ────────────────────────────────────────────────────────
 AGENT_SYSTEM_PROMPT = """\
-你是一名希沃课堂分析助手，拥有丰富的教研经验。
+你是一个通用的 ReAct Agent，可以按需调用外部工具完成用户任务。
 
-【工具使用规则】
-1. report_id 是 32 位十六进制字符串，请从用户输入自行提取：
-   - 直接出现在文字中：如 "96f58e78b80c462cb1194fa2f6ef4e97"
-   - 出现在 URL 中：.../report/detail/<report_id>/home 或 .../detail/js2/<report_id>/home
-2. 根据用户的分析需求选择合适工具；"综合分析"或"全面分析"时可按需调用多个工具
-3. 若无法从用户输入中找到 report_id，礼貌询问
-
-【分析输出要求】
-- 基于工具返回的真实数据，不得臆造
-- 符合 BID 反馈原则：先认同优点，再给出改进建议
-- 每个维度分析 150 字以内，整合成一段话，不分行
+【工作原则】
+1. 先理解用户目标，再根据工具描述决定是否调用工具
+2. 工具所需参数应优先从用户输入和已有上下文中提取
+3. 如果缺少必要参数且无法可靠推断，应先向用户提问，不要臆造
+4. 可以多轮调用工具，但只调用与当前任务直接相关的工具
+5. 最终回答必须基于已有上下文和工具结果，不得编造未观测到的信息
+6. 回答语言默认跟随用户输入语言
 """
 
 
@@ -90,6 +77,7 @@ class CompactSpanExporter:
         pass
 
     def force_flush(self, timeout_millis: int = 30000):
+        _ = timeout_millis
         return True
 
 
@@ -136,8 +124,6 @@ def _load_config() -> dict:
     content = cfg_path.read_text(encoding="utf-8")
     result = {}
     for key, pattern in [
-        ("token",    r"x-token=([^;`\s]+)"),
-        ("username", r"x-username=([^;`\s]+)"),
         ("api_key",  r"api_key:\s*([^\s`]+)"),
         ("api_base", r"api_base:\s*([^\s`]+)"),
         ("model",    r"model:\s*([^\s`]+)"),
@@ -157,31 +143,26 @@ class SeewoAgent:
     def __init__(self):
         cfg = _load_config()
         self.api_key  = cfg.get("api_key")
-        self.token    = cfg.get("token")
-        self.username = cfg.get("username")
         if not self.api_key:
             raise ValueError("未找到 api_key，请在 SEEWO_CONFIG.md 中配置")
         self.api_base = cfg.get("api_base") or "https://token.cvte.com/v1"
         self.model    = cfg.get("model") or "deepseek-v4-pro"
         self.mcp_client = SeewoMCPClient(project_root=Path(__file__).parent)
-        self.skill_registry = self._load_mcp_tools()
-        self.tools = [meta["tool_spec"] for meta in self.skill_registry.values()]
+        self.tool_registry = self._load_mcp_tools()
+        self.tools = [meta["tool_spec"] for meta in self.tool_registry.values()]
         if not self.tools:
             raise ValueError("未发现可用 MCP 工具，请检查 mcp/server.py")
 
     def _load_mcp_tools(self) -> dict:
-        """从本地 MCP 服务发现工具，并映射到 skill 元信息。"""
+        """从本地 MCP 服务发现工具。"""
         tools = self.mcp_client.list_tools()
         registry = {}
         for tool in tools:
             tool_name = (tool.get("name") or "").strip()
             if not tool_name:
                 continue
-            meta = TOOL_REGISTRY.get(tool_name, {})
             registry[tool_name] = {
                 "tool_name": tool_name,
-                "skill_dir": meta.get("skill_dir"),
-                "skill_name": meta.get("skill_name", tool_name),
                 "tool_spec": {
                     "type": "function",
                     "function": {
@@ -193,70 +174,47 @@ class SeewoAgent:
             }
         return registry
 
-    # ── 内部：获取 Skill 数据 ─────────────────────────────────────────
-    def _get_skill_data(self, report_id: str, skill_meta: dict) -> dict:
-        """通过本地 MCP 服务获取工具数据。"""
-        with tracer.start_as_current_span("seewo.skill.fetch_data") as span:
-            skill_dir = skill_meta.get("skill_dir") or "mcp"
-            skill_name = skill_meta["skill_name"]
-            span.set_attribute("skill.name", skill_name)
-            span.set_attribute("skill.dir", skill_dir)
-            span.set_attribute("report.id",    report_id)
-            tool_payload = self.mcp_client.call_tool(skill_meta["tool_name"], {"report_id": report_id})
-            input_text = json.dumps(tool_payload, ensure_ascii=False, indent=2)
-            span.set_attribute("skill.input_text.length", len(input_text))
-            course_info = tool_payload.get("course") or {}
+    def _extract_context_from_tool_result(self, tool_result: dict) -> dict:
+        """从工具结果里提取可用于 CLI / API 展示的通用上下文。"""
+        if not isinstance(tool_result, dict):
+            return {}
+        if isinstance(tool_result.get("course"), dict):
+            return tool_result["course"]
+        if isinstance(tool_result.get("context"), dict):
+            return tool_result["context"]
+        return {}
 
-            span.set_attribute("course.name",    course_info.get("课程名称", ""))
-            span.set_attribute("course.teacher", course_info.get("教师姓名", ""))
-            return {"input_text": input_text, "course_info": course_info}
-
-    # ── 内部：加载 Skill 专属分析指引 ────────────────────────────────
-    def _load_skill_guidelines(self, skill_meta: dict) -> str:
-        with tracer.start_as_current_span("seewo.skill.load_prompt") as span:
-            span.set_attribute("skill.name", skill_meta["skill_name"])
-            if not skill_meta.get("skill_dir"):
-                prompt = (
-                    "这是全量课堂上下文工具。仅在当前维度数据不足、需要做跨维度交叉验证或补充证据时使用；"
-                    "仍应保持当前问题的分析主线，不要把所有维度逐个展开。"
-                )
-                span.set_attribute("prompt.length", len(prompt))
-                return prompt
-            skill_md = SKILLS_DIR / skill_meta["skill_dir"] / "SKILL.md"
-            try:
-                content = skill_md.read_text(encoding="utf-8")
-                m = re.search(r"```\n(.*?)\n```", content, re.DOTALL)
-                prompt = m.group(1).strip() if m else ""
-                span.set_attribute("prompt.length", len(prompt))
-                return prompt
-            except Exception as e:
-                span.record_exception(e)
-                return ""
+    def _format_context_summary(self, context: dict) -> str:
+        """把通用上下文字典压缩成一行摘要，避免 CLI 写死领域字段。"""
+        if not isinstance(context, dict) or not context:
+            return ""
+        parts = []
+        for key, value in context.items():
+            if value in (None, "", [], {}):
+                continue
+            parts.append(f"{key}: {value}")
+            if len(parts) >= 3:
+                break
+        return "  ".join(parts)
 
     # ── 内部：执行工具调用 ────────────────────────────────────────────
     def _execute_tool(self, tool_name: str, args: dict) -> str:
         """执行工具，返回 JSON 字符串给 LLM。"""
         with tracer.start_as_current_span("seewo.tool.execute") as span:
             span.set_attribute("tool.name", tool_name)
-            report_id = args.get("report_id", "").strip()
-            span.set_attribute("report.id", report_id)
+            for key, value in args.items():
+                if isinstance(value, (str, int, float, bool)):
+                    span.set_attribute(f"tool.arg.{key}", value)
 
-            skill_meta = self.skill_registry.get(tool_name)
-            if not skill_meta:
+            tool_meta = self.tool_registry.get(tool_name)
+            if not tool_meta:
                 return json.dumps({"error": f"未知工具：{tool_name}"}, ensure_ascii=False)
-            if not report_id:
-                return json.dumps({"error": "缺少 report_id 参数"}, ensure_ascii=False)
 
             try:
-                skill_data  = self._get_skill_data(report_id, skill_meta)
-                guidelines  = self._load_skill_guidelines(skill_meta)
-                result = {
-                    "skill":               skill_meta["skill_name"],
-                    "course":              skill_data["course_info"],
-                    "data":                skill_data["input_text"],
-                    "analysis_guidelines": guidelines,
-                }
+                result = self.mcp_client.call_tool(tool_name, args)
                 span.set_attribute("tool.success", True)
+                if isinstance(result, dict):
+                    span.set_attribute("tool.result.length", len(json.dumps(result, ensure_ascii=False)))
                 return json.dumps(result, ensure_ascii=False, indent=2)
             except Exception as e:
                 span.record_exception(e)
@@ -351,7 +309,7 @@ class SeewoAgent:
                                     "role": "user",
                                     "content": (
                                         "请直接基于现有上下文输出最终回答，不要调用任何工具。"
-                                        "必须返回可直接展示给用户的中文分析文本；"
+                                        "必须返回可直接展示给用户的最终文本；"
                                         "如果信息不足，请明确说明原因。"
                                     ),
                                 }]
@@ -420,16 +378,17 @@ class SeewoAgent:
                             except json.JSONDecodeError:
                                 tool_args = {}
 
-                            print(f"  🔧 [{turn}] {tool_name}  report_id={tool_args.get('report_id', '?')}")
+                            print(f"  🔧 [{turn}] {tool_name}  args={tool_args}")
 
                             result_str = self._execute_tool(tool_name, tool_args)
 
-                            # 顺带抓一下课程信息供 CLI 展示
+                            # 顺带抓一下通用上下文供 CLI / API 展示
                             if not course_info:
                                 try:
                                     obj = json.loads(result_str)
-                                    if "course" in obj:
-                                        course_info = obj["course"]
+                                    context = self._extract_context_from_tool_result(obj)
+                                    if context:
+                                        course_info = context
                                 except Exception:
                                     pass
 
@@ -450,33 +409,14 @@ class SeewoAgent:
                 return {"success": False, "error": str(e)}
 
 
-# ── 交互式 CLI ────────────────────────────────────────────────────────────
-def print_banner():
-    print("\n" + "=" * 80)
-    print("🤖 希沃课堂分析 Agent（ReAct · MCP Tool Bridge）")
-    print("=" * 80)
-    print("\n自然语言输入示例：")
-    print("  帮我看看这节课的互动情况：https://easiinsight.seewo.com/report/detail/96f58e78.../home")
-    print("  分析一下 96f58e78b80c462cb1194fa2f6ef4e97 的提问质量")
-    print("  全面分析这个报告 96f58e78b80c462cb1194fa2f6ef4e97")
-    print("\n输入 quit 退出")
-    print("=" * 80 + "\n")
-
-
 def main():
     try:
         agent = SeewoAgent()
-        print("✓ Agent 初始化成功（ReAct 模式）")
-        tf = getattr(_setup_tracing, "trace_file", None)
-        if tf:
-            print(f"📊 Trace → {tf}（tail -f 可实时查看；设 SEEWO_TRACE_CONSOLE=1 打印到终端）")
-        print()
     except Exception as e:
         print(f"❌ 初始化失败：{e}")
-        print("请确保 SEEWO_CONFIG.md 中已配置 api_key 和 cookie")
+        print("请确保 SEEWO_CONFIG.md 中已配置 api_key，且本地 MCP 服务可正常启动")
         return
-
-    print_banner()
+    print("你好，我能为你做什么？")
 
     while True:
         try:
@@ -494,9 +434,9 @@ def main():
             if result["success"]:
                 info = result.get("course_info", {})
                 if info:
-                    print(f"课程：{info.get('课程名称', '')}  "
-                          f"教师：{info.get('教师姓名', '')}  "
-                          f"学校：{info.get('学校名称', '')}")
+                    summary = agent._format_context_summary(info)
+                    if summary:
+                        print(f"上下文：{summary}")
                 print(f"（调用 {result['tool_calls']} 个工具，共 {result['turns']} 轮对话）")
                 print("─" * 80)
                 answer = (result.get("answer") or "").strip()

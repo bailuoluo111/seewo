@@ -38,8 +38,6 @@ priority: 5
 ## 代码示例
 
 ```text
-当前版本通过 MCP 工具取数，不再使用 skills 目录下的本地脚本。
-
 推荐调用顺序：
 1. 先调用当前维度工具：analyze_teacher_speech
 2. 如需补充上下文，再调用：get_all_classroom_context
@@ -58,5 +56,3 @@ args: {"report_id": "your-report-id"}
 - answer_time：是否留出了足够思考时间
 - question_effectiveness：提问质量是否与讲授节奏匹配
 ```
-
-**输入示例**: `讲授字数6724字，讲授时长1722秒，平均语速3.9字/秒`

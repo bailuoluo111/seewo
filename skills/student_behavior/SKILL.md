@@ -40,8 +40,6 @@ priority: 2
 ## 代码示例
 
 ```text
-当前版本通过 MCP 工具取数，不再使用 skills 目录下的本地脚本。
-
 推荐调用顺序：
 1. 先调用当前维度工具：analyze_student_behavior
 2. 如需补充上下文，再调用：get_all_classroom_context
@@ -60,5 +58,3 @@ args: {"report_id": "your-report-id"}
 - teacher_speech：教师讲授占比是否过高
 - question_effectiveness：提问层次是否支持更高阶学习行为
 ```
-
-**输入示例**: `被动学习29.5%，讨论9.1%，实践61.4%，估算知识留存率52.4%`

@@ -4,7 +4,6 @@ description: 基于SOLO分类法评估学生回答的建构水平
 version: 1.0.0
 priority: 3
 ---
-
 # System Prompt
 
 ```
@@ -40,8 +39,6 @@ SOLO分类法包含5个层级：
 ## 代码示例
 
 ```text
-当前版本通过 MCP 工具取数，不再使用 skills 目录下的本地脚本。
-
 推荐调用顺序：
 1. 先调用当前维度工具：analyze_solo_classification
 2. 如需补充上下文，再调用：get_all_classroom_context
@@ -60,5 +57,3 @@ args: {"report_id": "your-report-id"}
 - answer_time：思考时长是否支撑更高建构水平
 - student_interaction：回答广度是否影响建构分布
 ```
-
-**输入示例**: `总回答13次，前结构7.7%，单点61.5%，多点23.1%，关联7.7%，抽象拓展0%`
