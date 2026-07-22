@@ -1,0 +1,1 @@
+"""Seewo MCP bridge package."""

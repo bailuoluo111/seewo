@@ -53,18 +53,26 @@ priority: 7
 
 ## 代码示例
 
-```python
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
-from extract import build_input, extract
+```text
+当前版本通过 MCP 工具取数，不再使用 skills 目录下的本地脚本。
 
-input_text = build_input("your-report-id")
+推荐调用顺序：
+1. 先调用当前维度工具：analyze_question_effectiveness
+2. 如需补充上下文，再调用：get_all_classroom_context
 
-from extract_all import extract_all
-all_data = extract_all("your-report-id")
-# all_data["question_effectiveness"]["布鲁姆"]  → 布鲁姆分类
-# all_data["question_effectiveness"]["理答"]    → 理答类型
-# all_data["question_effectiveness"]["提问有效性得分"]
+示例：
+tool: analyze_question_effectiveness
+args: {"report_id": "your-report-id"}
+
+如需结合课堂表现做交叉验证，可再调用：
+tool: get_all_classroom_context
+args: {"report_id": "your-report-id"}
+
+优先关注：
+- question_effectiveness：本维度主数据
+- answer_time：提问层次是否带来更长思考时间
+- solo_classification：提问质量是否提升回答建构水平
+- student_interaction：高质量提问是否带动更多参与
 ```
 
 **输入示例**: `总问题37个，高阶思维占比32.4%，高质量理答占比20.0%，提问有效性得分71`

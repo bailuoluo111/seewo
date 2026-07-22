@@ -4,7 +4,6 @@ description: 分析教师讲授的语速、字数、时长，评估讲授节奏
 version: 1.0.0
 priority: 5
 ---
-
 # System Prompt
 
 ```
@@ -38,16 +37,26 @@ priority: 5
 
 ## 代码示例
 
-```python
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
-from extract import build_input, extract
+```text
+当前版本通过 MCP 工具取数，不再使用 skills 目录下的本地脚本。
 
-input_text = build_input("your-report-id")
+推荐调用顺序：
+1. 先调用当前维度工具：analyze_teacher_speech
+2. 如需补充上下文，再调用：get_all_classroom_context
 
-from extract_all import extract_all
-all_data = extract_all("your-report-id")
-# all_data["teacher_speech"]  → 本维度（字数/时长/语速）
+示例：
+tool: analyze_teacher_speech
+args: {"report_id": "your-report-id"}
+
+如需判断讲授节奏对课堂其他表现的影响，可再调用：
+tool: get_all_classroom_context
+args: {"report_id": "your-report-id"}
+
+优先关注：
+- teacher_speech：本维度主数据
+- student_interaction：讲授占比是否压缩互动
+- answer_time：是否留出了足够思考时间
+- question_effectiveness：提问质量是否与讲授节奏匹配
 ```
 
 **输入示例**: `讲授字数6724字，讲授时长1722秒，平均语速3.9字/秒`

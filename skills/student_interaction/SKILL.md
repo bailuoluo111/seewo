@@ -35,21 +35,26 @@ priority: 1
 
 ## 代码示例
 
-```python
-# 推荐：直接使用本 Skill 自带的提取工具
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
-from extract import build_input, extract
+```text
+当前版本通过 MCP 工具取数，不再使用 skills 目录下的本地脚本。
 
-# 仅本维度数据（喂给 LLM）
-input_text = build_input("your-report-id")
+推荐调用顺序：
+1. 先调用当前维度工具：analyze_student_interaction
+2. 如需补充上下文，再调用：get_all_classroom_context
 
-# 如需参考其他维度数据
-from extract_all import extract_all
-all_data = extract_all("your-report-id")
-# all_data["student_interaction"]  → 本维度
-# all_data["student_behavior"]     → 学习行为（可选参考）
-# ...其他维度同理
+示例：
+tool: analyze_student_interaction
+args: {"report_id": "your-report-id"}
+
+如需辅助判断互动表现是否受其他因素影响，可再调用：
+tool: get_all_classroom_context
+args: {"report_id": "your-report-id"}
+
+优先关注：
+- student_interaction：本维度主数据
+- student_behavior：学习投入方式
+- question_effectiveness：提问质量是否影响参与
+- teacher_speech：讲授节奏是否压缩互动空间
 ```
 
 **输入示例**: `平均抬头率72.6%，平均举手率35.8%，平均参与度16.8%，小学学段`

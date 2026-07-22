@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-agent.py — 希沃课堂分析 Agent（ReAct 工具调用循环，DeepSeek v4）
+agent.py — 希沃课堂分析 Agent（ReAct + MCP 工具桥接）
 
 架构：ReAct (Reasoning + Acting)
-  - 7 个 Skill 注册为 LLM 工具，Agent 自主决定调用哪个
+  - 通过本地 MCP 服务统一发现并调用课堂观察工具
   - report_id 由 LLM 从自然语言中提取，不限制输入格式
   - Agent loop：持续调用 LLM → 执行工具 → 喂回结果，直到无工具调用退出
   - OpenTelemetry 全链路追踪
@@ -21,106 +21,24 @@ import re
 import os
 import sys
 import json
-import importlib.util
 from pathlib import Path
 
-# 动态加载 skill 脚本时不生成 __pycache__（避免污染 skills 目录）
+# 保持运行目录整洁，避免本地模块生成 __pycache__
 sys.dont_write_bytecode = True
 
 # ── OpenTelemetry（必需依赖）─────────────────────────────────────────────
 from opentelemetry import trace as _otel_trace
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.trace.status import Status, StatusCode
 
+from mcp.client import SeewoMCPClient
+from mcp.tools import TOOL_REGISTRY
 
-# ── Skill 目录映射 ────────────────────────────────────────────────────────
+
+# ── Skill 根目录 ──────────────────────────────────────────────────────────
 SKILLS_DIR = Path(__file__).parent / "skills"
-
-SKILL_DIRS = {
-    1: "student_interaction",
-    2: "student_behavior",
-    3: "solo_classification",
-    4: "answer_time",
-    5: "teacher_speech",
-    6: "course_reengineering",
-    7: "question_effectiveness",
-}
-SKILL_NAMES = {
-    1: "学生互动分析",
-    2: "学习行为分析",
-    3: "SOLO分类分析",
-    4: "应答时间分析",
-    5: "讲授分析",
-    6: "课堂流程重构",
-    7: "提问有效性分析",
-}
-
-# 工具名 → skill 编号
-TOOL_SKILL_MAP = {
-    "analyze_student_interaction":    1,
-    "analyze_student_behavior":       2,
-    "analyze_solo_classification":    3,
-    "analyze_answer_time":            4,
-    "analyze_teacher_speech":         5,
-    "analyze_course_reengineering":   6,
-    "analyze_question_effectiveness": 7,
-}
-
-# ── 工具定义（传给 LLM 的 JSON Schema）──────────────────────────────────
-_REPORT_ID_PARAM = {
-    "type": "object",
-    "properties": {
-        "report_id": {
-            "type": "string",
-            "description": (
-                "课程报告的唯一ID（32位十六进制字符串）。"
-                "可从用户输入的URL中提取：.../report/detail/<report_id>/home，"
-                "或直接出现在文字中。"
-            ),
-        }
-    },
-    "required": ["report_id"],
-}
-
-TOOLS = [
-    {"type": "function", "function": {
-        "name": "analyze_student_interaction",
-        "description": "分析学生互动数据：平均抬头率（专注度）、平均举手率（参与意愿）、平均参与度（实际回答比例）。结合学段给出差异化建议。",
-        "parameters": _REPORT_ID_PARAM,
-    }},
-    {"type": "function", "function": {
-        "name": "analyze_student_behavior",
-        "description": "基于学习金字塔理论分析学习行为分布：7类行为（听讲/阅读/视听/演示/讨论/实践/教给他人）的时长占比，估算知识留存率。",
-        "parameters": _REPORT_ID_PARAM,
-    }},
-    {"type": "function", "function": {
-        "name": "analyze_solo_classification",
-        "description": "基于SOLO分类法评估学生回答建构水平：前结构/单点结构/多点结构/关联结构/抽象拓展五级分布。",
-        "parameters": _REPORT_ID_PARAM,
-    }},
-    {"type": "function", "function": {
-        "name": "analyze_answer_time",
-        "description": "分析学生应答时间分布：≤5秒/5-15秒/>15秒三档，评估问题难度层次和学生思考深度。",
-        "parameters": _REPORT_ID_PARAM,
-    }},
-    {"type": "function", "function": {
-        "name": "analyze_teacher_speech",
-        "description": "分析教师讲授数据：讲授字数、时长、平均语速（字/秒）。参考最佳语速3-4字/秒。",
-        "parameters": _REPORT_ID_PARAM,
-    }},
-    {"type": "function", "function": {
-        "name": "analyze_course_reengineering",
-        "description": "评估课堂流程重构度：课前→课中、课中→课后链接等级（初阶/进阶/中阶/高阶）。",
-        "parameters": _REPORT_ID_PARAM,
-    }},
-    {"type": "function", "function": {
-        "name": "analyze_question_effectiveness",
-        "description": "综合分析提问有效性：布鲁姆六级提问分类（含高阶思维占比）、教师理答类型分布（简单肯定/针对肯定/启发鼓励等）、提问有效性综合得分。",
-        "parameters": _REPORT_ID_PARAM,
-    }},
-]
 
 # ── Agent 系统提示 ────────────────────────────────────────────────────────
 AGENT_SYSTEM_PROMPT = """\
@@ -245,47 +163,66 @@ class SeewoAgent:
             raise ValueError("未找到 api_key，请在 SEEWO_CONFIG.md 中配置")
         self.api_base = cfg.get("api_base") or "https://token.cvte.com/v1"
         self.model    = cfg.get("model") or "deepseek-v4-pro"
+        self.mcp_client = SeewoMCPClient(project_root=Path(__file__).parent)
+        self.skill_registry = self._load_mcp_tools()
+        self.tools = [meta["tool_spec"] for meta in self.skill_registry.values()]
+        if not self.tools:
+            raise ValueError("未发现可用 MCP 工具，请检查 mcp/server.py")
+
+    def _load_mcp_tools(self) -> dict:
+        """从本地 MCP 服务发现工具，并映射到 skill 元信息。"""
+        tools = self.mcp_client.list_tools()
+        registry = {}
+        for tool in tools:
+            tool_name = (tool.get("name") or "").strip()
+            if not tool_name:
+                continue
+            meta = TOOL_REGISTRY.get(tool_name, {})
+            registry[tool_name] = {
+                "tool_name": tool_name,
+                "skill_dir": meta.get("skill_dir"),
+                "skill_name": meta.get("skill_name", tool_name),
+                "tool_spec": {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("inputSchema", {}),
+                    },
+                },
+            }
+        return registry
 
     # ── 内部：获取 Skill 数据 ─────────────────────────────────────────
-    def _get_skill_data(self, report_id: str, skill_num: int) -> dict:
-        """动态加载 skills/<skill>/scripts/extract.py，返回 input_text 和 course_info。"""
+    def _get_skill_data(self, report_id: str, skill_meta: dict) -> dict:
+        """通过本地 MCP 服务获取工具数据。"""
         with tracer.start_as_current_span("seewo.skill.fetch_data") as span:
-            skill_dir = SKILL_DIRS[skill_num]
-            span.set_attribute("skill.name",   SKILL_NAMES[skill_num])
-            span.set_attribute("skill.number", skill_num)
+            skill_dir = skill_meta.get("skill_dir") or "mcp"
+            skill_name = skill_meta["skill_name"]
+            span.set_attribute("skill.name", skill_name)
+            span.set_attribute("skill.dir", skill_dir)
             span.set_attribute("report.id",    report_id)
-
-            scripts_dir = str(SKILLS_DIR / skill_dir / "scripts")
-            # extract.py 内部有 from seewo_client import，需先把 scripts_dir 加入 sys.path
-            if scripts_dir not in sys.path:
-                sys.path.insert(0, scripts_dir)
-
-            # 动态加载 extract.py
-            spec = importlib.util.spec_from_file_location(
-                f"extract_{skill_num}", os.path.join(scripts_dir, "extract.py")
-            )
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            input_text = mod.build_input(report_id, self.token, self.username)
+            tool_payload = self.mcp_client.call_tool(skill_meta["tool_name"], {"report_id": report_id})
+            input_text = json.dumps(tool_payload, ensure_ascii=False, indent=2)
             span.set_attribute("skill.input_text.length", len(input_text))
-
-            # 动态加载 seewo_client.py 取课程信息
-            cspec = importlib.util.spec_from_file_location(
-                f"seewo_client_{skill_num}", os.path.join(scripts_dir, "seewo_client.py")
-            )
-            cmod = importlib.util.module_from_spec(cspec)
-            cspec.loader.exec_module(cmod)
-            course_info = cmod.SeewoClient(report_id, self.token, self.username).get_course_info()
+            course_info = tool_payload.get("course") or {}
 
             span.set_attribute("course.name",    course_info.get("课程名称", ""))
             span.set_attribute("course.teacher", course_info.get("教师姓名", ""))
             return {"input_text": input_text, "course_info": course_info}
 
     # ── 内部：加载 Skill 专属分析指引 ────────────────────────────────
-    def _load_skill_guidelines(self, skill_num: int) -> str:
+    def _load_skill_guidelines(self, skill_meta: dict) -> str:
         with tracer.start_as_current_span("seewo.skill.load_prompt") as span:
-            span.set_attribute("skill.name", SKILL_NAMES[skill_num])
-            skill_md = SKILLS_DIR / SKILL_DIRS[skill_num] / "SKILL.md"
+            span.set_attribute("skill.name", skill_meta["skill_name"])
+            if not skill_meta.get("skill_dir"):
+                prompt = (
+                    "这是全量课堂上下文工具。仅在当前维度数据不足、需要做跨维度交叉验证或补充证据时使用；"
+                    "仍应保持当前问题的分析主线，不要把所有维度逐个展开。"
+                )
+                span.set_attribute("prompt.length", len(prompt))
+                return prompt
+            skill_md = SKILLS_DIR / skill_meta["skill_dir"] / "SKILL.md"
             try:
                 content = skill_md.read_text(encoding="utf-8")
                 m = re.search(r"```\n(.*?)\n```", content, re.DOTALL)
@@ -304,17 +241,17 @@ class SeewoAgent:
             report_id = args.get("report_id", "").strip()
             span.set_attribute("report.id", report_id)
 
-            skill_num = TOOL_SKILL_MAP.get(tool_name)
-            if not skill_num:
+            skill_meta = self.skill_registry.get(tool_name)
+            if not skill_meta:
                 return json.dumps({"error": f"未知工具：{tool_name}"}, ensure_ascii=False)
             if not report_id:
                 return json.dumps({"error": "缺少 report_id 参数"}, ensure_ascii=False)
 
             try:
-                skill_data  = self._get_skill_data(report_id, skill_num)
-                guidelines  = self._load_skill_guidelines(skill_num)
+                skill_data  = self._get_skill_data(report_id, skill_meta)
+                guidelines  = self._load_skill_guidelines(skill_meta)
                 result = {
-                    "skill":               SKILL_NAMES[skill_num],
+                    "skill":               skill_meta["skill_name"],
                     "course":              skill_data["course_info"],
                     "data":                skill_data["input_text"],
                     "analysis_guidelines": guidelines,
@@ -343,7 +280,7 @@ class SeewoAgent:
                     max_tokens=768 if not use_tools else 512,
                 )
                 if use_tools:
-                    kwargs["tools"]       = TOOLS
+                    kwargs["tools"]       = self.tools
                     kwargs["tool_choice"] = "auto"
 
                 resp = client.chat.completions.create(**kwargs)
@@ -516,7 +453,7 @@ class SeewoAgent:
 # ── 交互式 CLI ────────────────────────────────────────────────────────────
 def print_banner():
     print("\n" + "=" * 80)
-    print("🤖 希沃课堂分析 Agent（ReAct · DeepSeek v4）")
+    print("🤖 希沃课堂分析 Agent（ReAct · MCP Tool Bridge）")
     print("=" * 80)
     print("\n自然语言输入示例：")
     print("  帮我看看这节课的互动情况：https://easiinsight.seewo.com/report/detail/96f58e78.../home")

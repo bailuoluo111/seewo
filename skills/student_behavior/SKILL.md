@@ -39,17 +39,26 @@ priority: 2
 
 ## 代码示例
 
-```python
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
-from extract import build_input, extract
+```text
+当前版本通过 MCP 工具取数，不再使用 skills 目录下的本地脚本。
 
-input_text = build_input("your-report-id")
+推荐调用顺序：
+1. 先调用当前维度工具：analyze_student_behavior
+2. 如需补充上下文，再调用：get_all_classroom_context
 
-# 可选：获取全部维度数据
-from extract_all import extract_all
-all_data = extract_all("your-report-id")
-# all_data["student_behavior"]  → 本维度（含7类行为占比+知识留存率）
+示例：
+tool: analyze_student_behavior
+args: {"report_id": "your-report-id"}
+
+如需进一步解释学习行为结构，可再调用：
+tool: get_all_classroom_context
+args: {"report_id": "your-report-id"}
+
+优先关注：
+- student_behavior：本维度主数据
+- student_interaction：互动是否与主动学习一致
+- teacher_speech：教师讲授占比是否过高
+- question_effectiveness：提问层次是否支持更高阶学习行为
 ```
 
 **输入示例**: `被动学习29.5%，讨论9.1%，实践61.4%，估算知识留存率52.4%`

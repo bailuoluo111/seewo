@@ -38,16 +38,26 @@ priority: 6
 
 ## 代码示例
 
-```python
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
-from extract import build_input, extract
+```text
+当前版本通过 MCP 工具取数，不再使用 skills 目录下的本地脚本。
 
-input_text = build_input("your-report-id")
+推荐调用顺序：
+1. 先调用当前维度工具：analyze_course_reengineering
+2. 如需补充上下文，再调用：get_all_classroom_context
 
-from extract_all import extract_all
-all_data = extract_all("your-report-id")
-# all_data["course_reengineering"]  → 本维度（链接等级+子任务）
+示例：
+tool: analyze_course_reengineering
+args: {"report_id": "your-report-id"}
+
+如需判断流程设计是否与课堂表现一致，可再调用：
+tool: get_all_classroom_context
+args: {"report_id": "your-report-id"}
+
+优先关注：
+- course_reengineering：本维度主数据
+- student_behavior：学习活动是否承接流程设计
+- student_interaction：流程设计是否带动参与
+- question_effectiveness：任务链条是否支持高阶思维
 ```
 
 **输入示例**: `课前到课中链接等级：高阶，课中到课后链接等级：高阶`
